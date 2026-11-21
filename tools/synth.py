@@ -62,7 +62,7 @@ def _module_assign_lines(tree):
 def mutate(repo: Path, rng: random.Random):
     pys = [p for p in repo.glob("sqlglot/**/*.py") if p.stat().st_size > 2000]
     kinds = os.environ.get("SYNTH_KINDS", "op,op,op,op,classattr,classattr,module,delete,insert,"
-                                          "comment,docstring,fixture,testfile,rename,import").split(",")
+                                          "comment,docstring,fixture,testfile,rename,import,method").split(",")
     kind = rng.choice(kinds)
     if kind == "fixture":
         fx = rng.choice([p for p in repo.glob("tests/fixtures/**/*.sql")])
@@ -83,6 +83,33 @@ def mutate(repo: Path, rng: random.Random):
         m = rng.choice(strs)
         new = old[:m.start()] + m.group(0).replace("SELECT", "SELECT DISTINCT", 1) + old[m.end():]
         return kind, str(tf.relative_to(repo)), old, new
+    if kind == "method":
+        # add an *_sql method to a generator class, or rename one away
+        gens = sorted(repo.glob("sqlglot/generators/*.py")) + [repo / "sqlglot/generator.py"]
+        f = rng.choice(gens)
+        old = f.read_text()
+        tree = ast.parse(old)
+        classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name.endswith("Generator")]
+        if not classes:
+            return None
+        cls = rng.choice(classes)
+        lines = old.split("\n")
+        methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name.endswith("_sql")
+                   and not n.name.startswith("_")]
+        if methods and rng.random() < 0.5:
+            n = rng.choice(methods)
+            lines[n.lineno - 1] = lines[n.lineno - 1].replace(f"def {n.name}(", f"def {n.name}_v2(", 1)
+        else:
+            keys = sorted({c.lower() for p in repo.glob("sqlglot/expressions/*.py")
+                           for c in re.findall(r"^class (\w+)\(", p.read_text(), re.M)})
+            have = {n.name[:-4] for n in methods}
+            key = rng.choice([k for k in keys if k not in have])
+            first = next((n for n in cls.body if isinstance(n, ast.FunctionDef)), None)
+            if first is None:
+                return None
+            at = min([first.lineno] + [d.lineno for d in first.decorator_list]) - 1
+            lines[at:at] = [f"    def {key}_sql(self, expression):", '        return "ZZZ"', ""]
+        return kind, str(f.relative_to(repo)), old, "\n".join(lines)
     f = rng.choice(pys)
     old = f.read_text()
     tree = ast.parse(old)

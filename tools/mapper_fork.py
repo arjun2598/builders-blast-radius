@@ -116,7 +116,7 @@ def run_one(t, modules, out, dump=True):
     path, cls_name, meth = nodeid.split("::")
     module = modules[path[:-3].replace("/", ".")]
     # drop what the parent recorded so this child dumps only its own test
-    for d in (mapper._hits, mapper._events, mapper._types, mapper._reads, mapper._cmp, mapper._keys):
+    for d in (mapper._hits, mapper._events, mapper._types, mapper._reads, mapper._cmp, mapper._keys, mapper._disp):
         d.clear()
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)

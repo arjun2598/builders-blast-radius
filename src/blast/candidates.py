@@ -43,6 +43,7 @@ class Map:
         self.keys: cmpcheck.KeyMap | None = None  # dict keys read, set by the caller
         self.needs: dict | None = None  # module file -> tests that imported it, set by load_needs
         self.needs_mapped: set[int] = set()
+        self.disp: dict | None = None  # generator dispatch map, set by load_disp
         self.import_ok: set[str] = set()  # files whose import-time runs were checked to leave the same state
         attrs = m.get("attrs", {"sets": [], "attr": {}, "import": {}})
         self.attr_sets, self.attr_index, self.attr_import = attrs["sets"], attrs["attr"], attrs["import"]
@@ -52,6 +53,77 @@ class Map:
         self.by_file: dict[str, list[int]] = {}
         for t in tests:
             self.by_file.setdefault(t["file"], []).append(t["number"])
+
+    def expr_keys(self) -> dict[str, set[str]]:
+        """Expression class name -> keys of it and its subclasses, read
+        statically from sqlglot/expressions (a class's key is its lowercased
+        name)."""
+        if getattr(self, "_expr_keys", None) is None:
+            bases: dict[str, set[str]] = {}
+            for f, text in self.sources.items():
+                if not f.startswith("sqlglot/expressions/"):
+                    continue
+                for n in ast.parse(text).body:
+                    if isinstance(n, ast.ClassDef):
+                        bases[n.name] = {b.id if isinstance(b, ast.Name) else b.attr for b in n.bases
+                                         if isinstance(b, (ast.Name, ast.Attribute))}
+            subs: dict[str, set[str]] = {c: {c} for c in bases}
+            changed = True
+            while changed:
+                changed = False
+                for c, bs in bases.items():
+                    for b in bs:
+                        if b in subs and not subs[c] <= subs[b]:
+                            subs[b] |= subs[c]
+                            changed = True
+            self._expr_keys = {c: {x.lower() for x in v} for c, v in subs.items()}
+        return self._expr_keys
+
+    def dyn_handler_sites(self) -> list:
+        """(file, line, keys or None) for each getattr(..., f"..._sql") in
+        sqlglot: keys are what an enclosing isinstance(x, exp.Cls) guard
+        allows, None when unguarded."""
+        if getattr(self, "_dyn_sites", None) is None:
+            out = []
+            for f, text in self.sources.items():
+                if not f.startswith("sqlglot/") or "getattr" not in text or "_sql" not in text:
+                    continue
+                tree = ast.parse(text)
+                parents: dict = {}
+                for n in ast.walk(tree):
+                    for ch in ast.iter_child_nodes(n):
+                        parents[ch] = n
+                for n in ast.walk(tree):
+                    if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "getattr"
+                            and len(n.args) >= 2 and isinstance(n.args[1], ast.JoinedStr)):
+                        continue
+                    tail = n.args[1].values[-1] if n.args[1].values else None
+                    if not (isinstance(tail, ast.Constant) and str(tail.value).endswith("_sql")):
+                        continue
+                    keys = None
+                    p = parents.get(n)
+                    while p is not None and not isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        t = p.test if isinstance(p, ast.If) else None
+                        if isinstance(t, ast.Call) and isinstance(t.func, ast.Name) and t.func.id == "isinstance" \
+                                and len(t.args) == 2 and isinstance(t.args[1], (ast.Attribute, ast.Name)):
+                            cname = t.args[1].attr if isinstance(t.args[1], ast.Attribute) else t.args[1].id
+                            if cname in self.expr_keys():
+                                keys = self.expr_keys()[cname]
+                                break
+                        p = parents.get(p)
+                    out.append((f, n.lineno, keys))
+            self._dyn_sites = out
+        return self._dyn_sites
+
+    def load_disp(self, path: str) -> None:
+        try:
+            with gzip.open(path, "rt") as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            return
+        d["mapped"] = set(d["mapped"])
+        d["mro"] = {g: set(b) for g, b in d["mro"].items()}
+        self.disp = d
 
     def load_needs(self, path: str) -> None:
         try:
@@ -97,12 +169,9 @@ class Map:
 
     def old_import_graph(self):
         if getattr(self, "_old_graph", None) is None:
-            from . import imports
+            from . import prebuild
 
-            g = imports.Graph(self.sources)
-            g.eager = g.closure(imports.EAGER_ROOTS)
-            g.dynamic = {f: imports.dynamic_sites(f, t) for f, t in self.sources.items()}
-            self._old_graph = g
+            self._old_graph = prebuild.graph(self.sources)
         return self._old_graph
 
     def import_breakers(self, f: str) -> set[int] | None:
@@ -419,6 +488,7 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
             res.dict_edit = None
     ctx = res.ctx(path, old_src)
     try:
+        new_tree._blast_lines = new_src.split("\n")
         _resolve_change(fd, tree, new_tree, ctx, res, m, sel)
     except OverBudget:
         if sel.everything:
@@ -518,7 +588,17 @@ def _resolve_change(fd, tree, new_tree, ctx, res, m, sel) -> None:
         t = _targets(stmt) if stmt is not None else None
         if t:
             removed_bound.setdefault(c[2], set()).update(t)
+    new_lines = getattr(new_tree, "_blast_lines", None)
+    in_string: set[int] = set()
+    if new_lines is not None:
+        for n in ast.walk(new_tree):
+            if isinstance(n, (ast.Constant, ast.JoinedStr)) and n.end_lineno and n.end_lineno > n.lineno:
+                in_string.update(range(n.lineno, n.end_lineno + 1))
     for line in added:
+        if new_lines is not None and 0 < line <= len(new_lines) and line not in in_string:
+            text = new_lines[line - 1].strip()
+            if not text or text.startswith("#"):
+                continue  # a blank or comment line outside any string: no code
         anchor = _anchor(new_st, line, added, new_to_old)
         if anchor is None:
             res.module_fallback(path, "insert at module top")
@@ -536,7 +616,7 @@ def _resolve_change(fd, tree, new_tree, ctx, res, m, sel) -> None:
                 qual = ctx.scopes.cls(old_line)[2]
                 if t and t <= removed_bound.get(qual, set()):
                     continue  # same attributes re-bound: a value change, already resolved
-                res.class_insert(path, ctx, old_line)
+                res.class_insert(path, ctx, old_line, _class_body_stmt(new_tree, line))
                 continue
             res.line(path, ctx, old_line)
         else:  # first statement of a function body: whoever calls the function
@@ -547,6 +627,38 @@ def _resolve_change(fd, tree, new_tree, ctx, res, m, sel) -> None:
                 res.line(path, ctx, old_line)
     for name in sorted(res.added_names):
         res.module_names(path, ctx, {name}, set(), 0)
+
+
+def _class_body_stmt(tree: ast.AST, line: int):
+    """The statement directly in a class body (innermost class) that holds
+    `line`, or None."""
+    best = None
+    stack = list(tree.body)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, ast.ClassDef) and n.lineno <= line <= n.end_lineno:
+            for st in n.body:
+                start = min([st.lineno] + [d.lineno for d in getattr(st, "decorator_list", [])])
+                if start <= line <= st.end_lineno:
+                    best = st
+                    if isinstance(st, ast.ClassDef):
+                        stack.append(st)
+        elif isinstance(n, (ast.If, ast.Try)) and n.lineno <= line <= n.end_lineno:
+            stack.extend(n.body)
+    return best
+
+
+_HARMLESS_DECORATORS = {"staticmethod", "classmethod", "unsupported_args"}
+
+
+def _plain_method(node) -> bool:
+    """A def whose decorators (run while the class is created) only wrap it."""
+    for d in node.decorator_list:
+        f = d.func if isinstance(d, ast.Call) else d
+        name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+        if name not in _HARMLESS_DECORATORS:
+            return False
+    return True
 
 
 def _bound_names(tree: ast.AST) -> set[str]:
@@ -744,17 +856,71 @@ class Resolver:
         stmt = next((s for s in cnode.body if s.lineno <= line <= s.end_lineno), None)
         if stmt is None:  # header, bases, decorators, keywords
             return self.class_fallback(path, qual, "class header")
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and _plain_method(stmt):
+            # a method's header changed or it went away: whatever could see
+            # the old method (its new version, if any, comes as an added line)
+            hit = self.method_users(path, qual, stmt.name)
+            if hit is not None:
+                hit |= self.m.line_tests(path, range(stmt.lineno, stmt.end_lineno + 1))
+                self.sel.tests |= hit
+                self.sel.notes.append(f"method {qual}.{stmt.name} changed or removed: {len(hit)} tests")
+                return
         names = _targets(stmt)
         if names is None:
             return self.class_fallback(path, qual, f"class-level {type(stmt).__name__}")
         self.class_attrs(path, ctx, cnode, qual, names, {id(stmt)}, depth)
 
-    def class_insert(self, path, ctx: Ctx, old_line) -> None:
+    def class_insert(self, path, ctx: Ctx, old_line, new_node=None) -> None:
         """A statement was added to a class body: it may define a new
         attribute that shadows a base class one. Readers can't be told apart,
-        so use every user of the class."""
+        so use every user of the class, unless it is a method added to a
+        generator class (see method_users)."""
         c = ctx.scopes.cls(old_line)
+        if isinstance(new_node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _plain_method(new_node):
+            hit = self.method_users(path, c[2], new_node.name)
+            if hit is not None:
+                self.sel.tests |= hit
+                self.sel.notes.append(f"method {c[2]}.{new_node.name} added: {len(hit)} tests")
+                return
         self.class_fallback(path, c[2], "statement added to class body")
+
+    def method_users(self, path: str, qual: str, name: str) -> set[int] | None:
+        """Tests that can see a method `name` appear in, or vanish from,
+        generator class `qual`: those whose generators (that class or a
+        subclass) looked up the expression a `<key>_sql` name dispatches,
+        plus every place that names the method directly. None when the class
+        is no generator the dispatch map knows."""
+        d = self.m.disp
+        if d is None:
+            return None
+        cls = f"{path[:-3].replace('/', '.').removesuffix('.__init__')}:{qual}"
+        if cls not in d["mro"]:
+            return None
+        out = set(self.m.popen) | ({t["number"] for t in self.m.tests} - d["mapped"])
+        if name.endswith("_sql") and not name.startswith("_"):
+            key = name[:-4]
+            for g, bases in d["mro"].items():
+                if cls in bases:
+                    out.update(d["by"].get(g, {}).get(key, ()))
+            # handlers looked up by a name built at run time, where an
+            # isinstance guard around the lookup doesn't rule this key out
+            for f, line, keys in self.m.dyn_handler_sites():
+                if keys is None or key in keys:
+                    out |= self.m.line_tests(f, [line])
+        # direct uses: attribute access, getattr strings, super() calls
+        ref = re.compile(rf"\.{re.escape(name)}\b|[\"']{re.escape(name)}[\"']")
+        for f, text in self.m.sources.items():
+            if name not in text:
+                continue
+            lines = [i for i, l in enumerate(text.split("\n"), 1) if ref.search(l)]
+            if not lines:
+                continue
+            if f.startswith("sqlglot/"):
+                out |= self.m.line_tests(f, lines)
+            else:
+                out |= set(self.m.by_file.get(f, ()))
+        out |= set(self.m.opens.get(path, ()))
+        return out
 
     def class_attrs(self, path, ctx: Ctx, cnode, qual, names: set[str], seen_stmts: set, depth) -> None:
         m, sel = self.m, self.sel

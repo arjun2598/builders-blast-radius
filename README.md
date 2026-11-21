@@ -50,6 +50,16 @@ ones against the patched code, and report only those that fail.
      of the dict, unless the key was read at import time;
    - a patch that changes only an `except` clause's types → tests that ran
      that header line (it runs only while an exception is being matched);
+   - a method added to, removed from or renamed in a generator class →
+     tests whose generator (that class or a subclass) looked up the
+     expression its `<key>_sql` name dispatches (`data/disp.json.gz`, from a
+     pass that swaps the per-class dispatch tables for recording ones), plus
+     every line that names the method, plus the handler lookups built from a
+     name at run time when an enclosing `isinstance(x, exp.Cls)` guard
+     allows the key (read statically from the expression class tree, so
+     `connector_sql`'s lookup counts only for `and`/`or`/`xor`). The
+     generator finds handlers by method name, so a
+     new method changes nothing else;
    - a fixture → tests that opened it; a new data file → tests that list its
      directory;
    - deleted/moved modules, unparseable or unmapped code → every test.
@@ -96,7 +106,12 @@ ones against the patched code, and report only those that fail.
    busiest worker's time plus 2 s per worker.
 
 Any error falls back to listing all candidates, so a crash costs time, never
-a miss.
+a miss. A child whose resident memory passes 1.4 GB is killed the same way,
+before the container's 4 GB limit can take the whole run down.
+
+What depends only on the pinned checkout (its import graph, its import-state
+fingerprint) is computed when the image is built (`python -m blast.prebuild`,
+written to `/app/prebuilt.pkl`) and reused if the checkout matches.
 
 ## Commands
 
@@ -154,6 +169,17 @@ MAP_KEYS=1 ../venv/bin/python ../../tools/mapper_fork.py ../../blast-radius-samp
 cd ../.. && python3 tools/build_cmp.py work/rawcmp work/rawcmpsplit blast-radius-sample/sample/tests.json data/map.json.gz data/cmp
 python3 tools/build_keys.py work/rawkeys work/rawkeyssplit blast-radius-sample/sample/tests.json data/map.json.gz data/keys
 ```
+
+The generator dispatch map (about 2 min):
+
+```sh
+cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=../../tools:../../src MAP_LINES=0 MAP_ATTRS=0 MAP_DISPATCH=1 \
+  ../venv/bin/python ../../tools/mapper_fork.py ../../blast-radius-sample/sample/tests.json ../rawdisp 7
+cd ../.. && python3 tools/build_disp.py work/rawdisp blast-radius-sample/sample/tests.json data/disp.json.gz
+```
+
+For native runs, build the prebuilt data once:
+`PYTHONPATH=src work/venv/bin/python -m blast.prebuild $PWD/work/sqlglot work/prebuilt.pkl`.
 
 The module-needs map (about 75 s):
 

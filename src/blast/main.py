@@ -32,6 +32,8 @@ DUCK = Path(os.environ.get("BLAST_DUCK", "/app/data/duck.pkl.gz"))
 CMP = Path(os.environ.get("BLAST_CMPMAP", "/app/data/cmp"))
 KEYS = Path(os.environ.get("BLAST_KEYMAP", "/app/data/keys"))
 NEEDS = Path(os.environ.get("BLAST_NEEDS", "/app/data/imports.json.gz"))
+PREBUILT = Path(os.environ.get("BLAST_PREBUILT", "/app/prebuilt.pkl"))
+DISP = Path(os.environ.get("BLAST_DISP", "/app/data/disp.json.gz"))
 SUB_BASE = 10_000_000  # map numbers of single pool tasks, see build_map.py
 SLOW = float(os.environ.get("BLAST_SLOW", "5.0"))  # CPU s: report unrun at/above this
 CPU_SCALE = float(os.environ.get("BLAST_CPU_SCALE", "1.2"))  # scorer box vs where cpu.json was measured
@@ -180,23 +182,28 @@ _origin_state: dict = {}
 
 
 def _fingerprint(req: dict, seed: str):
-    import subprocess
-    import tempfile
+    from . import prebuild
 
-    with tempfile.NamedTemporaryFile("w", suffix=".json", dir=TMP, delete=False) as fh:
-        json.dump(req, fh)
-    env = dict(os.environ, PYTHONHASHSEED=seed, PYTHONPATH=str(Path(__file__).resolve().parent.parent))
-    if PYC and os.path.isdir(PYC):
-        env["PYTHONPYCACHEPREFIX"] = PYC
     try:
-        r = subprocess.run([sys.executable, "-m", "blast.fingerprint", str(REPO.resolve()), fh.name], env=env, cwd=str(TMP),
-                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
-        return json.loads(r.stdout) if r.returncode == 0 else None
+        return prebuild.fingerprint(str(REPO.resolve()), req, seed, PYC)
     except Exception as e:  # noqa: BLE001
         log("fingerprint failed:", repr(e))
         return None
-    finally:
-        os.unlink(fh.name)
+
+
+CHILD_RSS_MB = float(os.environ.get("BLAST_CHILD_MB", "1400"))
+_PAGE_MB = os.sysconf("SC_PAGE_SIZE") / 2**20 if hasattr(os, "sysconf") else 4 / 1024
+
+
+def _rss_mb(pid: int) -> float:
+    """Resident memory of a child (Linux; 0 where /proc is missing). Pages
+    shared with the parent since the fork count too, so the limit leaves
+    room for them."""
+    try:
+        with open(f"/proc/{pid}/statm") as fh:
+            return int(fh.read().split()[1]) * _PAGE_MB
+    except (OSError, ValueError, IndexError):
+        return 0.0
 
 
 def import_state_same(c: "Commit", probe: dict) -> bool:
@@ -205,11 +212,9 @@ def import_state_same(c: "Commit", probe: dict) -> bool:
     import (not by some test module's)? Values that differ between two
     imports of the pinned tree are noise no test can rely on."""
     if "base" not in _origin_state:
-        a = _fingerprint({"files": {}, "watch_all": True}, "0")
-        b = _fingerprint({"files": {}}, "1")
-        _origin_state["base"] = None if a is None or b is None else (
-            a["fp"], {k for k in a["fp"] if b["fp"].get(k) != a["fp"][k]} | (set(b["fp"]) ^ set(a["fp"])),
-            {f: set(ls) for f, ls in a["ran"].items()}, set(a["errors"]))
+        from . import prebuild
+
+        _origin_state["base"] = prebuild.base_state(str(REPO.resolve()), PYC)
     base = _origin_state["base"]
     if base is None:
         return False
@@ -323,8 +328,18 @@ def main() -> None:
 
         m.keys = cmpcheck.KeyMap(str(KEYS))
     m.load_needs(str(NEEDS))
+    m.load_disp(str(DISP))
     for f in list(REPO.glob("sqlglot/**/*.py")) + list(REPO.glob("tests/**/*.py")):
         m.sources[str(f.relative_to(REPO))] = f.read_text()
+    from . import prebuild
+
+    pre = prebuild.load(str(PREBUILT), REPO, m.sources)
+    if pre is not None:
+        m._old_graph = pre["graph"]
+        if pre.get("state") is not None:
+            _origin_state["base"] = pre["state"]
+    else:
+        log("no prebuilt data for this checkout")
 
     commits = [Commit(p.stem, p.read_text()) for p in sorted((DATA / "commits").glob("*.patch"))]
     only = os.environ.get("BLAST_ONLY")
@@ -333,6 +348,8 @@ def main() -> None:
     # 3 min for ~40 commits in practice, 4.5 min for ~60 in the final
     budget = float(os.environ.get("BLAST_BUDGET", 150 if len(commits) <= 45 else 235))
     child_cpu = [0.0]
+    last_mem = [0.0]
+    peak_mb = [0.0]
     last_ru = [0.0]
     cm = CostModel(tests, CPU_TABLE)
     for c in commits:
@@ -427,11 +444,20 @@ def main() -> None:
         if pid:
             child_cpu[0] += ru.ru_utime + ru.ru_stime
             last_ru[0] = ru.ru_utime + ru.ru_stime
+            peak_mb[0] = ru.ru_maxrss / (2**20 if sys.platform == "darwin" else 1024)
         if pid == 0:
             now = time.monotonic()
+            check_mem = now - last_mem[0] > 0.2
+            if check_mem:
+                last_mem[0] = now
             for p, (c, slot, t0, limit) in list(running.items()):
                 if now - t0 > limit or now - START > budget + 15:
                     log(c.id, "child too slow, killing")
+                    os.kill(p, 9)
+                elif check_mem and _rss_mb(p) > CHILD_RSS_MB:
+                    # a runaway test: losing this commit's run (its candidates
+                    # get listed) beats the container being killed at 4 GB
+                    log(c.id, f"child over {CHILD_RSS_MB} MB, killing")
                     os.kill(p, 9)
             time.sleep(0.005)
             continue
@@ -439,7 +465,7 @@ def main() -> None:
         ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
         finish(c, slot, ok)
         log(f"{c.id}: ran {len(c.run)} in {time.monotonic() - t0:.2f}s cpu {last_ru[0]:.2f}s "
-            f"(est {cm.commit_cpu(c):.2f}s) -> report {len(c.report)}")
+            f"(est {cm.commit_cpu(c):.2f}s) peak {peak_mb[0]:.0f} MB -> report {len(c.report)}")
 
     out = []
     for c in commits:

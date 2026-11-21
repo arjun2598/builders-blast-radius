@@ -30,6 +30,7 @@ def main(repo, sample, map_path):
 
         m.keys = cmpcheck.KeyMap(key_dir)
     m.load_needs(os.environ.get("BLAST_NEEDS", str(Path(map_path).parent / "imports.json.gz")))
+    m.load_disp(os.environ.get("BLAST_DISP", str(Path(map_path).parent / "disp.json.gz")))
     for f in list(repo.glob("sqlglot/**/*.py")) + list(repo.glob("tests/**/*.py")):
         m.sources[str(f.relative_to(repo))] = f.read_text()
     total = 0.0

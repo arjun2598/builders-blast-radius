@@ -487,6 +487,49 @@ def _install_keys():
 if os.environ.get("MAP_KEYS") == "1":
     _install_keys()
 
+# With MAP_DISPATCH=1 the generator's per-class dispatch tables (expression
+# class -> handler, built from TRANSFORMS and the *_sql method names) record
+# which expression keys each generator class looked up, hits and misses
+# alike: that is what a new, removed or renamed *_sql method can change.
+
+_disp: dict = {}  # key -> set of (generator class "module:qualname", expression key)
+_disp_mro: dict = {}  # generator class -> its bases ("module:qualname"), itself first
+
+
+def _cname(c):
+    return f"{c.__module__}:{c.__qualname__}"
+
+
+class _DispDict(dict):
+    __slots__ = ("_cls",)
+
+    def get(self, k, default=None):
+        try:
+            _disp.setdefault(_key, set()).add((self._cls, getattr(k, "key", None) or k.__name__.lower()))
+        except Exception:  # noqa: BLE001
+            pass
+        return dict.get(self, k, default)
+
+
+def _install_dispatch():
+    import sqlglot.generator as g
+
+    orig = g._build_dispatch
+
+    def wrap(cls, d):
+        w = _DispDict(d)
+        w._cls = _cname(cls)
+        _disp_mro[w._cls] = [_cname(b) for b in cls.__mro__ if b is not object]
+        return w
+
+    def build(cls):
+        return wrap(cls, orig(cls))
+
+    g._build_dispatch = build
+    for cls, d in list(g._DISPATCH_CACHE.items()):
+        g._DISPATCH_CACHE[cls] = wrap(cls, d)
+
+
 mon.use_tool_id(TOOL, "mapper")
 mon.register_callback(TOOL, mon.events.LINE, _on_line)
 if os.environ.get("MAP_LINES", "1") == "1":
@@ -510,6 +553,8 @@ def pytest_configure(config):
         except Exception:
             pass
     _wrap_inits()
+    if os.environ.get("MAP_DISPATCH") == "1":
+        _install_dispatch()
 
 
 def _class_keys(types):
@@ -618,6 +663,8 @@ def sections_dump(with_names=False):
                         for k, v in _cmp.items()},
         "keys": lambda: {k: {d: (sorted(o) if o is not None else None) for d, o in v.items()}
                          for k, v in _keys.items()},
+        "disp": lambda: {k: sorted(map(list, v)) for k, v in _disp.items()},
+        "disp_mro": lambda: dict(_disp_mro),
     }
     data = {}
     for name, fn in sections.items():
