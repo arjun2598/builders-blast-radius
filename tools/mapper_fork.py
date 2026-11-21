@@ -20,7 +20,9 @@ os.environ.setdefault("MAP_OUT", "/dev/null")
 import mapper  # noqa: E402  installs tracing, attribute wrapping, sync executor
 
 
-def main(tests_json, out, jobs="8"):
+def main(tests_json, out, jobs="8", split=""):
+    """split="1": instead of whole tests, map each process-pool task of the
+    slow tests separately (see split_tests)."""
     jobs = int(jobs)
     os.makedirs(out, exist_ok=True)
     sys.path.insert(0, os.getcwd())
@@ -40,7 +42,10 @@ def main(tests_json, out, jobs="8"):
     with open(os.path.join(out, "base.json"), "w") as fh:
         json.dump(base, fh)
 
-    running, queue, failed = {}, list(tests), []
+    queue = list(tests)
+    if split:
+        queue = split_tests(tests, modules, out, jobs)
+    running, failed = {}, []
     t0 = time.time()
     done = 0
     while queue or running:
@@ -75,8 +80,39 @@ def main(tests_json, out, jobs="8"):
     print(f"done {done} in {time.time() - t0:.0f}s, failed: {failed[:10]} ({len(failed)})", flush=True)
 
 
-def run_one(t, modules, out):
+SPLIT_MIN_SECONDS = 3.0
+
+
+def split_tests(tests, modules, out, jobs):
+    """For each slow test, count the pool tasks it submits (running none of
+    them), then queue one job per task in which only that task runs; the
+    others yield None. A test that passes with every task skipped and whose
+    tasks are mapped this way can later be run with only the tasks a change
+    reaches. Writes n<number>.json with the count and whether that held."""
+    jobs_out = []
+    for t in tests:
+        if t["seconds"] < SPLIT_MIN_SECONDS:
+            continue
+        pid = os.fork()
+        if pid == 0:
+            mapper._tasks["only"] = -1
+            ok = run_one(t, modules, out, dump=False) == 0
+            with open(os.path.join(out, f"n{t['number']:05d}.json"), "w") as fh:
+                json.dump({"ntasks": mapper._tasks["n"], "ok": ok}, fh)
+            os._exit(0)
+        os.waitpid(pid, 0)
+        info = json.load(open(os.path.join(out, f"n{t['number']:05d}.json")))
+        print(t["id"], info, flush=True)
+        if info["ok"] and info["ntasks"] >= 2:
+            jobs_out += [dict(t, task=i) for i in range(info["ntasks"])]
+    return jobs_out
+
+
+def run_one(t, modules, out, dump=True):
     nodeid = t["id"]
+    task = t.get("task")
+    if task is not None:
+        mapper._tasks["only"] = task
     path, cls_name, meth = nodeid.split("::")
     module = modules[path[:-3].replace("/", ".")]
     # drop what the parent recorded so this child dumps only its own test
@@ -85,14 +121,17 @@ def run_one(t, modules, out):
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
-    mapper._switch(nodeid + "\0c")
+    mapper._switch(nodeid + (f"#task{task}" if task is not None else "") + "\0c")
     suite = unittest.TestSuite([getattr(module, cls_name)(meth)])
     result = unittest.TestResult()
     suite.run(result)
     mapper._switch("")
+    if not dump:
+        return 0 if result.wasSuccessful() else 4
     data = mapper.sections_dump()
     data["ok"] = result.wasSuccessful()
-    with open(os.path.join(out, f"t{t['number']:05d}.json"), "w") as fh:
+    name = f"t{t['number']:05d}" if task is None else f"p{t['number']:05d}_{task:04d}"
+    with open(os.path.join(out, name + ".json"), "w") as fh:
         json.dump(data, fh)
     return 0 if result.wasSuccessful() else 4
 

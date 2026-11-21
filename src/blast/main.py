@@ -28,6 +28,8 @@ PYC = os.environ.get("BLAST_PYC", "/opt/pyc")
 TMP = Path(os.environ.get("BLAST_TMP", "/tmp"))
 SLOTS = int(os.environ.get("BLAST_SLOTS", "2"))
 CPU_TABLE = Path(os.environ.get("BLAST_CPU", "/app/data/cpu.json"))
+DUCK = Path(os.environ.get("BLAST_DUCK", "/app/data/duck.pkl.gz"))
+SUB_BASE = 10_000_000  # map numbers of single pool tasks, see build_map.py
 SLOW = float(os.environ.get("BLAST_SLOW", "5.0"))  # CPU s: report unrun at/above this
 CPU_SCALE = float(os.environ.get("BLAST_CPU_SCALE", "1.2"))  # scorer box vs where cpu.json was measured
 BASE_CPU = 0.08  # fork, result file, bookkeeping per commit
@@ -105,6 +107,8 @@ class Commit:
         self.run: list[int] = []  # tests to execute
         self.new_files: dict[str, str | None] = {}
         self.ok = True
+        self.subsets: dict[int, list[int]] = {}  # test -> the only pool tasks to run
+        self.duck = False  # recorded DuckDB answers still valid
 
 
 def prepare(c: Commit, m: candidates.Map, all_tests: list[dict], cm: "CostModel") -> None:
@@ -128,9 +132,24 @@ def prepare(c: Commit, m: candidates.Map, all_tests: list[dict], cm: "CostModel"
             if fd.binary:
                 raise patch.ApplyError("binary patch")
         sel = candidates.select(diffs, old, new, m)
-        cands = set(secs) if sel.everything else sel.tests
+        cands = set(secs) if sel.everything else set(sel.tests)
         if sel.notes:
             log(c.id, "notes:", "; ".join(sel.notes))
+        # Single pool tasks of split tests. Only trusted when the change is
+        # sqlglot code alone: test code and data are what the split was
+        # mapped with.
+        tasks: dict[int, set[int]] = {}
+        for t in [t for t in cands if t >= SUB_BASE]:
+            cands.discard(t)
+            p = (t - SUB_BASE) // 1000
+            tasks.setdefault(p, set()).add(t % 1000)
+            cands.add(p)
+        changed = list(c.new_files)
+        c.duck = all(f.endswith(".py") for f in changed)
+        if not sel.everything and all(f.startswith("sqlglot/") and f.endswith(".py") for f in changed):
+            for p, idx in tasks.items():
+                if p in m.subtasks and len(idx) < m.subtasks[p]:
+                    c.subsets[p] = sorted(idx)
     except Exception as e:  # noqa: BLE001
         log(c.id, "prepare failed, running everything:", repr(e))
         cands = set(secs)
@@ -138,7 +157,12 @@ def prepare(c: Commit, m: candidates.Map, all_tests: list[dict], cm: "CostModel"
     if not c.ok:
         c.report = set(cands)
         return
-    c.report, c.run = cm.decide(cands, c.new_files)
+    c.report, c.run = cm.decide(cands, c.new_files, c.subsets, c.duck)
+    for t in list(c.subsets):
+        if t not in c.run:
+            del c.subsets[t]
+    if c.subsets:
+        log(c.id, "tasks:", {t: len(v) for t, v in c.subsets.items()})
 
 
 class CostModel:
@@ -154,12 +178,24 @@ class CostModel:
             self.cpu = {int(k): v * CPU_SCALE for k, v in d["test"].items()}
             self.cls = {k: v * CPU_SCALE for k, v in d["class"].items()}
             self.mod = {k: v * CPU_SCALE for k, v in d["module"].items()}
+            # split tests: [fixed, per task] CPU with DuckDB answers reused
+            self.sub = {int(k): (v["fixed"] * CPU_SCALE, [x * CPU_SCALE for x in v["task"]])
+                        for k, v in d.get("sub", {}).items()}
+            self.duck = {int(k): v * CPU_SCALE for k, v in d.get("duck", {}).items()}
         except Exception as e:  # noqa: BLE001
             log("no cpu table, using recorded seconds:", repr(e))
-            self.cpu, self.cls, self.mod = {}, {}, {}
+            self.cpu, self.cls, self.mod, self.sub, self.duck = {}, {}, {}, {}, {}
+        self.subsets: dict[int, list[int]] = {}  # of the commit being costed
+        self.use_duck = False
 
     def test_cpu(self, t: int) -> float:
-        return self.cpu.get(t, self.secs[t] * 1.5)
+        if t in self.subsets and t in self.sub:
+            fixed, per = self.sub[t]
+            return fixed + sum(per[i] for i in self.subsets[t] if i < len(per))
+        cpu = self.cpu.get(t, self.secs[t] * 1.5)
+        if self.use_duck and t in self.duck:
+            return min(cpu, self.duck[t])
+        return cpu
 
     def run_cpu(self, tests, purge: bool) -> float:
         if not tests:
@@ -171,19 +207,24 @@ class CostModel:
                 + sum(self.cls.get(c, 0.0) for c in classes)
                 + sum(self.mod.get(f, 0.05) for f in files))
 
+    def commit_cpu(self, c: "Commit") -> float:
+        self.subsets, self.use_duck = c.subsets, c.duck
+        return self.run_cpu(c.run, True)
+
     def pack_cost(self, tests) -> float:
         workers = pack(sorted(tests), self.ms)
         if not workers:
             return 0.0
         return (max(sum(self.ms[t] for t in w) for w in workers) + WORKER_COST_MS * len(workers)) / 1000
 
-    def decide(self, cands: set[int], changed: dict) -> tuple[set[int], list[int]]:
+    def decide(self, cands: set[int], changed: dict, subsets=None, duck=False) -> tuple[set[int], list[int]]:
         """Split candidates into (report unrun, run). Tests whose CPU exceeds
         what listing them would cost go unrun; then pick the cheaper of
         listing everything vs. running the rest and reporting what fails."""
+        self.subsets, self.use_duck = subsets or {}, duck
         if not cands:
             return set(), []
-        slow = {t for t in cands if self.test_cpu(t) >= SLOW}
+        slow = {t for t in cands if self.test_cpu(t) >= max(SLOW, self.secs[t])}
         rest = cands - slow
         purge = any(f.endswith(".py") for f in changed)
         list_all = self.pack_cost(cands)
@@ -216,6 +257,8 @@ def main() -> None:
         commits = [c for c in commits if c.id in only.split(",")]
     # 3 min for ~40 commits in practice, 4.5 min for ~60 in the final
     budget = float(os.environ.get("BLAST_BUDGET", 150 if len(commits) <= 45 else 235))
+    child_cpu = [0.0]
+    last_ru = [0.0]
     cm = CostModel(tests, CPU_TABLE)
     for c in commits:
         prepare(c, m, tests, cm)
@@ -235,9 +278,24 @@ def main() -> None:
         log("sqlglot preload failed:", repr(e))
     from . import runner
 
+    if DUCK.exists() and any(c.duck and c.run for c in commits):
+        try:
+            from . import duckcache
+
+            duckcache.install(str(REPO), str(DUCK))  # loaded once, shared by children
+        except Exception as e:  # noqa: BLE001
+            log("duck cache failed:", repr(e))
+
+    # Everything loaded so far lives as long as the run: keep the collector
+    # from re-scanning it (and children from un-sharing its pages).
+    import gc
+
+    gc.collect()
+    gc.freeze()
+    setup_cpu = time.process_time()
     slots = [Slot(i) for i in range(SLOTS)]
     free = list(range(SLOTS))
-    queue = sorted((c for c in commits if c.run), key=lambda c: cm.run_cpu(c.run, True))
+    queue = sorted((c for c in commits if c.run), key=cm.commit_cpu)
     running: dict[int, tuple[Commit, int, float, float]] = {}  # pid -> (commit, slot, start, limit)
 
     def finish(c: Commit, slot: int, ok: bool) -> None:
@@ -263,7 +321,7 @@ def main() -> None:
         elapsed = time.monotonic() - START
         while queue and free:
             c = queue.pop(0)
-            est = cm.run_cpu(c.run, True) * 1.3 + 1
+            est = cm.commit_cpu(c) * 1.3 + 1
             if elapsed + est / SLOTS > budget:
                 log(c.id, f"over budget at {elapsed:.0f}s, reporting candidates unrun")
                 c.report |= set(c.run)
@@ -277,7 +335,9 @@ def main() -> None:
                 try:
                     sys.pycache_prefix = PYC
                     runner.run(str(slots[slot].path), str(REPO.resolve()), list(c.new_files),
-                               [ids[t] for t in c.run], timeouts, str(TMP / f"res_{c.id}.json"))
+                               [ids[t] for t in c.run], timeouts, str(TMP / f"res_{c.id}.json"),
+                               subsets={ids[t]: v for t, v in c.subsets.items()},
+                               duck=str(DUCK) if c.duck and DUCK.exists() else None)
                 except BaseException as e:  # noqa: BLE001
                     log(c.id, "child error", repr(e))
                     code = 1
@@ -285,7 +345,10 @@ def main() -> None:
             running[pid] = (c, slot, time.monotonic(), est * 2 + 20)
         if not running:
             continue
-        pid, status = os.waitpid(-1, os.WNOHANG)
+        pid, status, ru = os.wait4(-1, os.WNOHANG)
+        if pid:
+            child_cpu[0] += ru.ru_utime + ru.ru_stime
+            last_ru[0] = ru.ru_utime + ru.ru_stime
         if pid == 0:
             now = time.monotonic()
             for p, (c, slot, t0, limit) in list(running.items()):
@@ -297,7 +360,8 @@ def main() -> None:
         c, slot, t0, _ = running.pop(pid)
         ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
         finish(c, slot, ok)
-        log(f"{c.id}: ran {len(c.run)} in {time.monotonic() - t0:.2f}s -> report {len(c.report)}")
+        log(f"{c.id}: ran {len(c.run)} in {time.monotonic() - t0:.2f}s cpu {last_ru[0]:.2f}s "
+            f"(est {cm.commit_cpu(c):.2f}s) -> report {len(c.report)}")
 
     out = []
     for c in commits:
@@ -305,7 +369,11 @@ def main() -> None:
     data = ("\n".join(out) + ("\n" if out else "")).encode()
     while data:
         data = data[os.write(answer_fd, data):]
-    log(f"done in {time.monotonic() - START:.1f}s")
+    import resource
+
+    me = resource.getrusage(resource.RUSAGE_SELF)
+    log(f"done in {time.monotonic() - START:.1f}s; cpu parent {me.ru_utime + me.ru_stime:.2f}s "
+        f"(setup {setup_cpu:.2f}s) children {child_cpu[0]:.2f}s")
 
 
 if __name__ == "__main__":

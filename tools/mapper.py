@@ -69,6 +69,9 @@ def _switch(key):
 _types: dict = {}  # key -> set of sqlglot types instantiated
 
 
+_tasks = {"n": 0, "only": None}  # pool tasks submitted so far; run only this one
+
+
 class _SyncExecutor:
     """Stands in for ProcessPoolExecutor so work done "in a child process" is
     traced and credited to the test that submitted it. Arguments and results
@@ -83,6 +86,11 @@ class _SyncExecutor:
         from concurrent.futures import Future
 
         fut = Future()
+        n = _tasks["n"]
+        _tasks["n"] = n + 1
+        if _tasks["only"] is not None and n != _tasks["only"]:
+            fut.set_result(None)  # skipped task, see mapper_fork split mode
+            return fut
         outer = _key
         if outer and os.environ.get("MAP_TASKS") == "1":
             # credit this task separately: <test>\0<phase>\0task<n>

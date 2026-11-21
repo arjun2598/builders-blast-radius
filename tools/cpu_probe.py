@@ -3,6 +3,7 @@ replaced by the in-process executor the selector uses) per test phase and
 per test-module import.
 
 PYTHONPATH=tools:../../src CPU_OUT=cpu.json python -m pytest -p cpu_probe tests
+Then tools/cpu_table.py turns it into data/cpu.json.
 """
 
 import json
@@ -11,7 +12,8 @@ import time
 
 import pytest
 
-from blast.runner import SyncExecutor
+from blast import duckcache
+from blast.runner import GC_THRESHOLD, SyncExecutor
 
 import concurrent.futures  # noqa: E402
 
@@ -27,6 +29,15 @@ def pytest_make_collect_report(collector):
     yield
     if isinstance(collector, pytest.Module):
         _mods[collector.nodeid] = time.process_time() - t
+
+
+def pytest_collection_finish(session):
+    # same collector settings as the runner's children
+    import gc
+
+    gc.collect()
+    gc.freeze()
+    gc.set_threshold(*GC_THRESHOLD)
 
 
 def _wrap(phase):

@@ -1,6 +1,6 @@
 """Combine raw mapper output into the compact map the selector ships with.
 
-python tools/build_map.py <rawmap dir> <tests.json> <out map.json.gz>
+python tools/build_map.py <rawmap dir> <tests.json> <out map.json.gz> [<split dir>]
 
 Map layout (test numbers are tests.json numbers):
   lines[file]   = {"sets": [[tests...]...], "line": {lineno: set index}}
@@ -9,6 +9,9 @@ Map layout (test numbers are tests.json numbers):
   opens[file]   = [tests that opened that file]
   lists[dir]    = [tests that listed that dir]
   popen         = [tests that started a subprocess]
+  subtasks      = {test: number of pool tasks}, from mapper_fork split mode.
+                  Task i of test T is mapped as test SUB_BASE + T*1000 + i:
+                  it ran T with only that task (the rest yielded None).
 """
 
 import gzip
@@ -18,9 +21,28 @@ from collections import defaultdict
 from pathlib import Path
 
 
-def main(raw_dir, tests_path, out_path):
+SUB_BASE = 10_000_000
+
+
+def main(raw_dir, tests_path, out_path, split_dir=None):
     tests = json.load(open(tests_path))["tests"]
     num = {t["id"]: t["number"] for t in tests}
+    subtasks = {}
+    if split_dir:
+        for p in sorted(Path(split_dir).glob("n*.json")):
+            info = json.load(open(p))
+            n = int(p.stem[1:])
+            if not info["ok"] or info["ntasks"] < 2:
+                continue
+            files = [Path(split_dir) / f"p{n:05d}_{i:04d}.json" for i in range(info["ntasks"])]
+            if not all(f.exists() and json.load(open(f)).get("ok") for f in files):
+                print(f"warning: split of test {n} incomplete or failing, not used", file=sys.stderr)
+                continue
+            subtasks[n] = info["ntasks"]
+        nid = {t["number"]: t["id"] for t in tests}
+        for n, k in subtasks.items():
+            for i in range(k):
+                num[f"{nid[n]}#task{i}"] = SUB_BASE + n * 1000 + i
 
     line_tests = defaultdict(lambda: defaultdict(set))
     import_lines = defaultdict(set)
@@ -38,9 +60,20 @@ def main(raw_dir, tests_path, out_path):
 
     seen_ids = set()
     failed_map = set()
-    base_path = Path(raw_dir) / "base.json"
-    base_names = json.load(open(base_path)).get("attr_names", []) if base_path.exists() else []
-    for path in sorted(Path(raw_dir).glob("*.json")):
+    def raw_files():
+        for d in [raw_dir] + ([split_dir] if split_dir else []):
+            base_path = Path(d) / "base.json"
+            names = json.load(open(base_path)).get("attr_names", []) if base_path.exists() else []
+            for path in sorted(Path(d).glob("*.json")):
+                if path.name.startswith("n"):
+                    continue
+                if d == split_dir and path.name.startswith("p") and int(path.stem[1:6]) not in subtasks:
+                    continue
+                if d == split_dir and path.name == "base.json":
+                    continue  # import-time data is the same as the main run's
+                yield path, names
+
+    for path, base_names in raw_files():
         raw = json.load(open(path))
         seen_ids |= {k.partition("\0")[0] for k in raw["hits"] if k}
         for key, files in raw["hits"].items():
@@ -128,6 +161,7 @@ def main(raw_dir, tests_path, out_path):
         raise SystemExit(f"raw map is missing {len(lost)} tests, e.g. {lost[:3]}: a worker failed")
 
     out = {"lines": {}, "import": {}, "users": {}, "opens": {}, "lists": {}, "popen": sorted(popen),
+           "subtasks": {str(k): v for k, v in subtasks.items()},
            "classes": {c: sorted(s) for c, s in classes.items()},
            "hooks": hooks}
     # attribute readers, deduplicated like line sets

@@ -37,7 +37,7 @@ def main(repo, sample, map_path):
         t0 = _t.process_time()
         sel = candidates.select(diffs, old, new, m)
         dt = _t.process_time() - t0
-        cand = set(secs) if sel.everything else sel.tests
+        cand = set(secs) if sel.everything else {t for t in sel.tests if t in secs}
         ans = answers[p.stem]
         missed = set(ans["failing"]) - cand
         cpu = sum(secs[t] for t in cand)

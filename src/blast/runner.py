@@ -22,6 +22,11 @@ import sys
 import unittest
 
 
+# Pool tasks of the running test: index of the next one, and which to run
+# (None = all). A skipped task's future yields None; see Map.subtasks.
+_tasks: dict = {"n": 0, "only": None}
+
+
 class SyncExecutor:
     """Replaces ProcessPoolExecutor: the work runs in this process (no spawned
     interpreters to pay for) but still crosses pickle, so pickling bugs still
@@ -35,6 +40,11 @@ class SyncExecutor:
         from concurrent.futures import Future
 
         fut = Future()
+        n = _tasks["n"]
+        _tasks["n"] = n + 1
+        if _tasks["only"] is not None and n not in _tasks["only"]:
+            fut.set_result(None)
+            return fut
         try:
             fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
             fut.set_result(pickle.loads(pickle.dumps(fn(*args, **kwargs))))
@@ -55,6 +65,9 @@ class SyncExecutor:
         self.shutdown()
 
 
+GC_THRESHOLD = tuple(int(x) for x in os.environ.get("BLAST_GC", "50000,50,100").split(","))
+
+
 class TestTimeout(Exception):
     pass
 
@@ -66,8 +79,9 @@ def _alarm(signum, frame):
 
 
 class Result(unittest.TestResult):
-    def __init__(self, ids: dict, timeouts: dict, stop_first: bool):
+    def __init__(self, ids: dict, timeouts: dict, stop_first: bool, subsets: dict | None = None):
         super().__init__()
+        self.subsets = subsets or {}
         self.ids = ids  # id(TestCase) -> nodeid
         self.timeouts = timeouts
         self.stop_first = stop_first
@@ -86,10 +100,13 @@ class Result(unittest.TestResult):
 
     def startTest(self, test):
         super().startTest(test)
+        sub = self.subsets.get(self.ids.get(id(test)))
+        _tasks["n"], _tasks["only"] = 0, (set(sub) if sub is not None else None)
         signal.setitimer(signal.ITIMER_REAL, self.timeouts.get(self.ids.get(id(test)), 30.0))
 
     def stopTest(self, test):
         signal.setitimer(signal.ITIMER_REAL, 0)
+        _tasks["n"], _tasks["only"] = 0, None
         nid = self.ids.get(id(test))
         if nid:
             self.done.add(nid)
@@ -122,7 +139,10 @@ def _repoint(workdir: str, origin: str) -> None:
 
 
 def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
-        timeouts: dict[str, float], out_path: str, stop_first: bool = True) -> None:
+        timeouts: dict[str, float], out_path: str, stop_first: bool = True,
+        subsets: dict[str, list[int]] | None = None, duck: str | None = None) -> None:
+    """subsets: nodeid -> the only pool tasks to run (the map says no other
+    task can see the change). duck: recorded DuckDB answers to reuse."""
     os.chdir(workdir)
     sys.path.insert(0, workdir)
     os.environ["SKIP_INTEGRATION"] = "0"
@@ -135,7 +155,24 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
         for name in [n for n in sys.modules if n == "sqlglot" or n.startswith(("sqlglot.", "tests"))]:
             del sys.modules[name]
     _repoint(workdir, origin)
+    if duck:
+        from . import duckcache
+
+        try:
+            duckcache.install(workdir, duck)
+        except Exception as e:  # noqa: BLE001  without answers, DuckDB just runs
+            print(f"duck cache unavailable: {e!r}", file=sys.stderr)
+            duckcache.uninstall()
+    elif "blast.duckcache" in sys.modules:
+        sys.modules["blast.duckcache"].uninstall()
     importlib.invalidate_caches()
+
+    # sqlglot allocates many short-lived objects; default thresholds make the
+    # cyclic collector a large share of test CPU. Explicit gc.collect() in
+    # tests behaves as before.
+    import gc
+
+    gc.set_threshold(GC_THRESHOLD[0], *GC_THRESHOLD[1:])
 
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)  # keep the parent's stdout clean
@@ -151,7 +188,7 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
         order.setdefault(parts[0], {}).setdefault(parts[1], []).append((nid, parts[2]))
 
     ids: dict[int, str] = {}
-    result = Result(ids, timeouts, stop_first)
+    result = Result(ids, timeouts, stop_first, subsets)
     failed: set[str] = set()
     for path, classes in order.items():
         if result.shouldStop:

@@ -36,6 +36,7 @@ class Map:
         self.popen = set(m["popen"])
         self.classes = m.get("classes", {})
         self.hooks = m.get("hooks", {})
+        self.subtasks = {int(k): v for k, v in m.get("subtasks", {}).items()}
         attrs = m.get("attrs", {"sets": [], "attr": {}, "import": {}})
         self.attr_sets, self.attr_index, self.attr_import = attrs["sets"], attrs["attr"], attrs["import"]
         self.tests = tests
@@ -494,6 +495,13 @@ class Resolver:
         self._tick()
         m, sel = self.m, self.sel
         span = ctx.scopes.func(line)
+        if span is not None and span[2] != line and line in m.imports.get(path, ()):
+            # this function ran while modules were being imported: what it
+            # computed (or raised) there is shared by every test, and the map
+            # credits import-time work to no test
+            sel.everything = True
+            sel.notes.append(f"function line run at import time {path}:{line}")
+            return
         if span is not None and span[2] != line:
             node = ctx.st.innermost(line)
             if STATEMENT_LEVEL and node is not None:

@@ -30,6 +30,7 @@ ones against the patched code, and report only those that fail.
      statement that reads the name, in its own file and in files that import
      it or access it as an attribute or string;
    - a removed name still used at import time → every test (imports break);
+   - a function line that ran while modules were imported → every test;
    - comment/format-only edits (identical AST) → only the touched functions;
    - a fixture → tests that opened it; a new data file → tests that list its
      directory;
@@ -46,6 +47,14 @@ ones against the patched code, and report only those that fail.
      only re-imports sqlglot when the patch touches a module that is already
      loaded;
    - process pools run in-process, still going through pickle;
+   - the parent freezes everything it preloaded out of the garbage
+     collector, and children raise its threshold: with the defaults, the
+     collector was close to half of test CPU;
+   - DuckDB answers recorded at the pinned commit (`data/duck.pkl.gz`) are
+     reused when the patched sqlglot sends DuckDB the exact same SQL;
+   - a slow test whose process-pool tasks were mapped one by one (the TPC-DS
+     and TPC-H executor tests) runs only the tasks the change can reach; the
+     others yield None, which the test already treats as "not executed";
    - it stops at the first failure; the tests it didn't run are listed.
 5. **Pack**: what gets reported is split across workers to minimise the
    busiest worker's time plus 2 s per worker.
@@ -77,6 +86,23 @@ Rebuild the map after changing the mapper:
 cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=../../tools:../../src \
   ../venv/bin/python ../../tools/mapper_fork.py ../../blast-radius-sample/sample/tests.json ../rawfork 6
 cd ../.. && python3 tools/build_map.py work/rawfork blast-radius-sample/sample/tests.json data/map.json.gz
+```
+
+Then map the pool tasks of slow tests one by one, record DuckDB answers and
+re-measure CPU (with the runner's GC settings):
+
+```sh
+cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=../../tools:../../src \
+  ../venv/bin/python ../../tools/mapper_fork.py ../../blast-radius-sample/sample/tests.json ../rawsplit 6 1
+cd ../.. && python3 tools/build_map.py work/rawfork blast-radius-sample/sample/tests.json data/map.json.gz work/rawsplit
+cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=.:../../src ../venv/bin/python ../../tools/duck_record.py \
+  ../../data/duck.pkl.gz tests.test_executor tests.test_optimizer
+SKIP_INTEGRATION=0 PYTHONPATH=../../tools:../../src CPU_OUT=../cpu_raw.json \
+  ../venv/bin/python -m pytest -q -p no:cacheprovider -p no:xdist -p cpu_probe tests
+cd ../.. && python3 tools/cpu_table.py work/cpu_raw.json blast-radius-sample/sample/tests.json data/cpu.json
+cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=.:../../src ../venv/bin/python ../../tools/split_probe.py \
+  ../../blast-radius-sample/sample/tests.json ../../data/map.json.gz ../../data/duck.pkl.gz ../../data/cpu.json \
+  tests.test_executor tests.test_optimizer
 ```
 
 Each test is mapped in its own forked process (about 3 min), so caches filled
