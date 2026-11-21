@@ -36,7 +36,9 @@ class Timed(unittest.TestResult):
 def main(tests_json, map_path, duck, cpu_path, *modules):
     tests = json.load(open(tests_json))["tests"]
     num = {t["id"]: t["number"] for t in tests}
-    subtasks = {int(k): v for k, v in json.load(gzip.open(map_path, "rt")).get("subtasks", {}).items()}
+    mp = json.load(gzip.open(map_path, "rt"))
+    subtasks = {int(k): v for k, v in mp.get("subtasks", {}).items()}
+    raising = set(mp.get("subtask_raise", ()))
     duckcache.install(os.getcwd(), duck)
     task_cpu = []
     orig = runner.SyncExecutor.submit
@@ -76,7 +78,21 @@ def main(tests_json, map_path, duck, cpu_path, *modules):
             per = list(task_cpu)
             assert len(per) == k, (n, len(per), k)
             total = r.cpu[next(iter(r.cpu))]
-            sub[n] = {"fixed": round(total - sum(per), 4), "task": [round(x, 4) for x in per]}
+            fixed = total - sum(per)
+            if n in raising:
+                # what runs per task outside the pool (checking each result)
+                # is skipped along with the task: measure the test with every
+                # task skipped and spread the rest over the tasks
+                runner._tasks.update({"n": 0, "only": set(), "raise": True})
+                r0 = Timed()
+                try:
+                    unittest.TestSuite([getattr(mod, cls)(meth)]).run(r0)
+                finally:
+                    runner._tasks.update({"n": 0, "only": None, "raise": False})
+                fixed = min(r0.cpu[next(iter(r0.cpu))], total)
+                scale = (total - fixed) / sum(per) if sum(per) else 0
+                per = [x * scale for x in per]
+            sub[n] = {"fixed": round(fixed, 4), "task": [round(x, 4) for x in per]}
             print(t["id"], "total", round(total, 2), "fixed", sub[n]["fixed"], file=sys.stderr)
     d = json.load(open(cpu_path))
     d["duck"] = {str(k): v for k, v in duck_cpu.items()}

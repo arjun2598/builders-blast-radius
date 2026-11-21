@@ -28,6 +28,7 @@ def main(raw_dir, tests_path, out_path, split_dir=None):
     tests = json.load(open(tests_path))["tests"]
     num = {t["id"]: t["number"] for t in tests}
     subtasks = {}
+    subtask_raise = set()
     if split_dir:
         for p in sorted(Path(split_dir).glob("n*.json")):
             info = json.load(open(p))
@@ -39,6 +40,8 @@ def main(raw_dir, tests_path, out_path, split_dir=None):
                 print(f"warning: split of test {n} incomplete or failing, not used", file=sys.stderr)
                 continue
             subtasks[n] = info["ntasks"]
+            if info.get("mode") == "raise":
+                subtask_raise.add(n)
         nid = {t["number"]: t["id"] for t in tests}
         for n, k in subtasks.items():
             for i in range(k):
@@ -162,6 +165,7 @@ def main(raw_dir, tests_path, out_path, split_dir=None):
 
     out = {"lines": {}, "import": {}, "users": {}, "opens": {}, "lists": {}, "popen": sorted(popen),
            "subtasks": {str(k): v for k, v in subtasks.items()},
+           "subtask_raise": sorted(subtask_raise),
            "classes": {c: sorted(s) for c, s in classes.items()},
            "hooks": hooks}
     # attribute readers, deduplicated like line sets

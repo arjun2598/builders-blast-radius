@@ -28,7 +28,15 @@ ones against the patched code, and report only those that fail.
      assignment → every user of the class;
    - a module-level name edit (constant, import, function header) → every
      statement that reads the name, in its own file and in files that import
-     it or access it as an attribute or string;
+     it from this module (or from one that re-exports it: a star import, an
+     import of the name, a package handing out submodule attributes from a
+     module-level `__getattr__`), or that can get hold of the module object
+     (by importing it or a package above it, or by loading modules
+     dynamically) and access the name as an attribute or string. An
+     attribute read on a name bound to some other imported module
+     (`t.Iterator` with `import typing as t`) doesn't count. A removed
+     name read that way at module level or in a class body makes importing
+     that file fail: its importers;
    - a removed name still used at import time → the tests that import that
      module (see below);
    - a function line that ran while modules were imported → every test,
@@ -36,7 +44,19 @@ ones against the patched code, and report only those that fail.
      value as it was (`src/blast/fingerprint.py`: one subprocess imports all
      of sqlglot with the patched texts swapped in and digests that state,
      code objects excluded; values that differ between two imports of the
-     pinned tree are ignored as noise). Then the line counts like any other;
+     pinned tree are ignored as noise, and so are names the patch itself adds
+     or removes, which the name rules follow). Then the line counts like any
+     other. If only lazily loaded modules come out different (a dialect
+     whose class body now fails, plus what that changes in eager registries
+     and packages), the probe runs again in the pinned and the patched tree
+     without those modules and their importers; if the rest then matches,
+     the tests that import those modules take the place of every test. The
+     same probe decides whether an edit to an eager module that is too
+     far-reaching to resolve still needs every test;
+   - a test that starts Python subprocesses (`test_lazy_load`) → only when
+     the patch touches a module those subprocesses loaded at the pinned
+     commit (`data/popen.json`, from `tools/mapper_popen.py`), or anything
+     but sqlglot code;
    - comment/format-only edits (identical AST) → nothing, beyond tests that
      read the file or look at code objects (bytecode is unchanged, only line
      numbers move); an encoding-line change counts as code;
@@ -89,19 +109,26 @@ ones against the patched code, and report only those that fail.
      loaded;
    - process pools run in-process, still going through pickle;
    - the parent freezes everything it preloaded out of the garbage
-     collector, and children raise its threshold: with the defaults, the
-     collector was close to half of test CPU;
+     collector, and children raise its threshold, so the collector runs far
+     less often;
    - DuckDB answers recorded at the pinned commit (`data/duck.pkl.gz`) are
      reused when the patched sqlglot sends DuckDB the exact same SQL;
-   - a slow test whose process-pool tasks were mapped one by one (the TPC-DS
-     and TPC-H executor tests) runs only the tasks the change can reach; the
-     others yield None, which the test already treats as "not executed";
+   - a slow test whose process-pool tasks were mapped one by one runs only
+     the tasks the change can reach. In the TPC-DS and TPC-H executor tests
+     the others yield None, which the test already treats as "not executed".
+     In the optimizer's fixture-file tests (`check_file`: simplify,
+     qualify_columns, merge_subqueries, optimize, TPC-DS/TPC-H and a few
+     more) a skipped task's future raises instead, so the subTest that
+     checks that case ends at once and is not counted; each case's check runs
+     only with its task. The mapper picks the mode that leaves the
+     test passing with no task run;
    - after a failure the rest of that test file is listed without running
      (failures cluster by file). Other files keep running while their
      estimated CPU is below the simulated time listing them would add, given
      the share of files that failed so far; otherwise everything not run is
-     listed. A failed subtest ends its test, and the split tests' pool tasks
-     run only when their results are read.
+     listed. A failed subtest ends its test, and the split executor tests'
+     pool tasks run only when their results are read (the optimizer's wait
+     for all of theirs first, so theirs run at once).
 5. **Pack**: what gets reported is split across workers to minimise the
    busiest worker's time plus 2 s per worker.
 
@@ -110,8 +137,10 @@ a miss. A child whose resident memory passes 1.4 GB is killed the same way,
 before the container's 4 GB limit can take the whole run down.
 
 What depends only on the pinned checkout (its import graph, its import-state
-fingerprint) is computed when the image is built (`python -m blast.prebuild`,
-written to `/app/prebuilt.pkl`) and reused if the checkout matches.
+fingerprint, each file's import table) is computed when the image is built (`python -m blast.prebuild`,
+written to `/app/prebuilt.pkl`) and reused if the checkout matches. The same
+step writes the decoded test map as a pickle (`/app/map.pkl`), used only if
+its hash matches `data/map.json.gz`, which is cheaper than decoding the JSON at every run.
 
 ## Commands
 
@@ -170,7 +199,7 @@ cd ../.. && python3 tools/build_cmp.py work/rawcmp work/rawcmpsplit blast-radius
 python3 tools/build_keys.py work/rawkeys work/rawkeyssplit blast-radius-sample/sample/tests.json data/map.json.gz data/keys
 ```
 
-The generator dispatch map (about 2 min):
+The generator dispatch map:
 
 ```sh
 cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=../../tools:../../src MAP_LINES=0 MAP_ATTRS=0 MAP_DISPATCH=1 \
@@ -178,10 +207,17 @@ cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=../../tools:../../src MAP_LINES
 cd ../.. && python3 tools/build_disp.py work/rawdisp blast-radius-sample/sample/tests.json data/disp.json.gz
 ```
 
-For native runs, build the prebuilt data once:
-`PYTHONPATH=src work/venv/bin/python -m blast.prebuild $PWD/work/sqlglot work/prebuilt.pkl`.
+The subprocess module map:
 
-The module-needs map (about 75 s):
+```sh
+cd work/sqlglot && PATH=$PWD/../venv/bin:$PATH PYTHONPATH=../../src ../venv/bin/python \
+  ../../tools/mapper_popen.py ../../data/map.json.gz ../../blast-radius-sample/sample/tests.json ../../data/popen.json
+```
+
+For native runs, build the prebuilt data once (again after rebuilding the map):
+`PYTHONPATH=src work/venv/bin/python -m blast.prebuild $PWD/work/sqlglot work/prebuilt.pkl data/map.json.gz`.
+
+The module-needs map:
 
 ```sh
 cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=../../tools:../../src \
@@ -189,7 +225,7 @@ cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=../../tools:../../src \
 cd ../.. && python3 tools/build_imports.py work/rawimports work/sqlglot data/imports.json.gz
 ```
 
-Each test is mapped in its own forked process (about 3 min), so caches filled
+Each test is mapped in its own forked process, so caches filled
 by one test (the generator's dispatch table, memoized lookups) can't hide
 from the map what another test depends on. The older in-process pytest
 plugin is still there (`-p mapper`) but under-reports for exactly this reason.

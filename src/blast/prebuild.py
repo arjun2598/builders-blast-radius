@@ -36,6 +36,15 @@ def graph(srcs: dict[str, str]) -> imports.Graph:
     return g
 
 
+def import_tables(srcs: dict[str, str]) -> dict:
+    """Each file's from-imports (see candidates.Map.import_table)."""
+    from . import candidates
+
+    m = candidates.Map.__new__(candidates.Map)
+    m.sources, m._import_tables = srcs, {}
+    return {f: m.import_table(f) for f in srcs if f.endswith(".py")}
+
+
 def fingerprint(repo: str, req: dict, seed: str, pyc: str | None = None):
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
         json.dump(req, fh)
@@ -65,10 +74,26 @@ def base_state(repo: str, pyc: str | None = None):
     return a["fp"], noise, {f: set(ls) for f, ls in a["ran"].items()}, set(a["errors"])
 
 
-def main(repo: str, out: str) -> None:
+def map_cache(map_path: str, out: str) -> None:
+    """The decoded test map as a pickle: about half the CPU of decoding the
+    JSON at every run."""
+    import gzip
+    import hashlib
+    import json
+
+    raw = open(map_path, "rb").read()
+    with open(out, "wb") as fh:
+        pickle.dump((hashlib.sha256(raw).hexdigest(), json.loads(gzip.decompress(raw))), fh,
+                    protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def main(repo: str, out: str, map_path: str | None = None) -> None:
+    if map_path:
+        map_cache(map_path, str(Path(out).with_name("map.pkl")))
     root = Path(repo).resolve()
     srcs = sources(root)
-    data = {"repo": str(root), "files": sorted(srcs), "graph": graph(srcs), "state": base_state(str(root))}
+    data = {"repo": str(root), "files": sorted(srcs), "graph": graph(srcs), "state": base_state(str(root)),
+            "import_tables": import_tables(srcs)}
     with open(out, "wb") as fh:
         pickle.dump(data, fh, protocol=pickle.HIGHEST_PROTOCOL)
     print(f"prebuilt: {len(srcs)} files, state {'ok' if data['state'] else 'missing'}", file=sys.stderr)

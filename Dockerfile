@@ -26,7 +26,7 @@ RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests >/dev/null \
 COPY src /app/src
 COPY data /app/data
 RUN python -m compileall -q /app/src >/dev/null \
- && cd /app && PYTHONPATH=/app/src python -m blast.prebuild /opt/sqlglot /app/prebuilt.pkl \
+ && cd /app && PYTHONPATH=/app/src python -m blast.prebuild /opt/sqlglot /app/prebuilt.pkl /app/data/map.json.gz \
  && chmod -R a+rX /app /opt
 
 WORKDIR /app

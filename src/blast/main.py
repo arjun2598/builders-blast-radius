@@ -12,6 +12,7 @@ Anything that goes wrong falls back to reporting every candidate unrun.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import shutil
@@ -32,6 +33,7 @@ DUCK = Path(os.environ.get("BLAST_DUCK", "/app/data/duck.pkl.gz"))
 CMP = Path(os.environ.get("BLAST_CMPMAP", "/app/data/cmp"))
 KEYS = Path(os.environ.get("BLAST_KEYMAP", "/app/data/keys"))
 NEEDS = Path(os.environ.get("BLAST_NEEDS", "/app/data/imports.json.gz"))
+POPEN = Path(os.environ.get("BLAST_POPEN", "/app/data/popen.json"))
 PREBUILT = Path(os.environ.get("BLAST_PREBUILT", "/app/prebuilt.pkl"))
 DISP = Path(os.environ.get("BLAST_DISP", "/app/data/disp.json.gz"))
 SUB_BASE = 10_000_000  # map numbers of single pool tasks, see build_map.py
@@ -138,13 +140,25 @@ def prepare(c: Commit, m: candidates.Map, all_tests: list[dict], cm: "CostModel"
                 raise patch.ApplyError("binary patch")
         sel = candidates.select(diffs, old, new, m)
         if sel.everything and sel.import_probe and all(p.startswith("sqlglot/") for p in sel.import_probe):
-            if import_state_same(c, sel.import_probe):
+            differ = import_state_diff(c, sel.import_probe, m)
+            if differ is not None:
                 m.import_ok = set(sel.import_probe)
                 try:
-                    sel = candidates.select(diffs, old, new, m)
+                    sel2 = candidates.select(diffs, old, new, m)
                 finally:
                     m.import_ok = set()
-                log(c.id, "import-time runs leave the same state:", "everything" if sel.everything else len(sel.tests))
+                # only code that imports a module whose state changed can see
+                # the change (an eager one is imported by every test)
+                for f in sorted(differ):
+                    users = m.import_breakers(f) if f else None
+                    if users is None:
+                        sel2.everything = True
+                        break
+                    sel2.tests |= users
+                if not differ or not sel2.everything:
+                    sel = sel2
+                log(c.id, "import-time runs change", sorted(differ) or "nothing", "->",
+                    "everything" if sel.everything else len(sel.tests))
         cands = set(secs) if sel.everything else set(sel.tests)
         if sel.notes:
             log(c.id, "notes:", "; ".join(sel.notes))
@@ -206,34 +220,118 @@ def _rss_mb(pid: int) -> float:
         return 0.0
 
 
-def import_state_same(c: "Commit", probe: dict) -> bool:
-    """Does importing the patched tree leave every module- and class-level
-    value as the pinned tree does, with the probed lines really run by that
-    import (not by some test module's)? Values that differ between two
-    imports of the pinned tree are noise no test can rely on."""
+def _module_file(name: str, m: candidates.Map, c: "Commit") -> str:
+    base = name.replace(".", "/")
+    for f in (base + ".py", base + "/__init__.py"):
+        if f in m.sources or c.new_files.get(f) is not None:
+            return f
+    return ""  # unknown: treated as imported by everything
+
+
+def import_state_diff(c: "Commit", probe: dict, m: candidates.Map) -> set[str] | None:
+    """Files of the sqlglot modules whose module- or class-level values (or
+    whether they import at all) differ when the patched tree is imported,
+    compared with the pinned tree; None when that can't be told, or when the
+    probed lines are not really run by that import (but by some test
+    module's). Values that differ between two imports of the pinned tree are
+    noise no test can rely on."""
     if "base" not in _origin_state:
         from . import prebuild
 
         _origin_state["base"] = prebuild.base_state(str(REPO.resolve()), PYC)
     base = _origin_state["base"]
     if base is None:
-        return False
+        return None
     fp0, noise, ran0, err0 = base
     if any(not set(ls) <= ran0.get(f, set()) for f, ls in probe.items()):
         log(c.id, "probed lines not run by importing sqlglot")
-        return False
+        return None
     files = {f: t for f, t in c.new_files.items() if f.endswith(".py")}
     if len(files) != len(c.new_files):
-        return False
+        return None
     r = _fingerprint({"files": files}, "0")
-    if r is None or set(r["errors"]) != err0:
-        log(c.id, "patched import failed or differs:", None if r is None else sorted(set(r["errors"]) ^ err0)[:5])
-        return False
+    if r is None:
+        return None
+    # names the patch itself binds or unbinds (a removed import, a renamed
+    # function or method) are followed by the resolver's name rules; whatever
+    # reads one while importing fails there or differs elsewhere
+    noise = noise | _renamed_keys(c, m)
+    mods = _differing(fp0, err0, r, noise)
+    if not mods:
+        return set()
+    log(c.id, "import-time state differs:", sorted(mods)[:8])
+    out = {_module_file(n, m, c) for n in mods}
+    # A module that registers itself somewhere eager (a dialect in the
+    # dialect registry, a submodule on its package) changes eager state
+    # only for tests that import it. Import everything but the lazily
+    # loaded modules that differ and their importers, in the pinned and
+    # the patched tree: if that leaves the same state, the change is
+    # confined to those modules' importers.
+    g, og = m.import_graph(), m.old_import_graph()
+    eager = g.eager | og.eager
+    lazy = {f for f in out if f and f not in eager}
+    if not lazy or "" in out:
+        return out
+    importers = set().union(*(g.importers(f) | og.importers(f) for f in lazy))
+    if importers & eager:
+        return out
+    skip = sorted(f[:-3].replace("/", ".").removesuffix(".__init__") for f in importers if f.startswith("sqlglot/"))
+    a = _fingerprint({"files": {}, "skip": skip}, "0")
+    b = _fingerprint({"files": files, "skip": skip}, "0")
+    if a is None or b is None or set(skip) & (set(a["loaded"]) | set(b["loaded"])):
+        return out
+    if _differing(a["fp"], set(a["errors"]), b, noise):
+        return out
+    log(c.id, "without", skip, "the import-time state is the same")
+    return lazy
+
+
+def _bound_names(src: str | None) -> set[str] | None:
+    """Top-level names of a module and its classes' own names, as
+    "name" and "Class.name"."""
+    if src is None:
+        return set()
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+
+    def names(body, prefix):
+        out = set()
+        for st in body:
+            if isinstance(st, (ast.Import, ast.ImportFrom)):
+                out |= {prefix + (a.asname or a.name.split(".")[0]) for a in st.names if a.name != "*"}
+            elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.add(prefix + st.name)
+            elif isinstance(st, ast.ClassDef):
+                out.add(prefix + st.name)
+                if not prefix:
+                    out |= names(st.body, st.name + ".")
+            elif isinstance(st, (ast.Assign, ast.AnnAssign)):
+                for t in (st.targets if isinstance(st, ast.Assign) else [st.target]):
+                    out |= {prefix + n.id for n in ast.walk(t) if isinstance(n, ast.Name)}
+        return out
+
+    return names(tree.body, "")
+
+
+def _renamed_keys(c: "Commit", m: candidates.Map) -> set[str]:
+    out = set()
+    for f, new_src in c.new_files.items():
+        if not (f.startswith("sqlglot/") and f.endswith(".py")):
+            continue
+        a, b = _bound_names(m.sources.get(f)), _bound_names(new_src)
+        if a is None or b is None:
+            continue
+        mod = f[:-3].replace("/", ".").removesuffix(".__init__")
+        out |= {f"{mod}:{n}" for n in a ^ b}
+    return out
+
+
+def _differing(fp0: dict, err0: set, r: dict, noise: set) -> set[str]:
+    """Module names whose digests or import errors differ."""
     keys = (set(fp0) | set(r["fp"])) - noise
-    diff = [k for k in keys if fp0.get(k) != r["fp"].get(k)]
-    if diff:
-        log(c.id, "import-time state differs:", diff[:5])
-    return not diff
+    return (set(r["errors"]) ^ err0) | {k.split(":", 1)[0] for k in keys if fp0.get(k) != r["fp"].get(k)}
 
 
 class CostModel:
@@ -318,7 +416,7 @@ def main() -> None:
     secs = {t["number"]: t["seconds"] for t in tests}
     ids = {t["number"]: t["id"] for t in tests}
     by_id = {t["id"]: t["number"] for t in tests}
-    m = candidates.Map(str(MAP), tests)
+    m = candidates.Map(str(MAP), tests, cache=str(PREBUILT.with_name("map.pkl")))
     if CMP.is_dir():
         from . import cmpcheck
 
@@ -328,6 +426,7 @@ def main() -> None:
 
         m.keys = cmpcheck.KeyMap(str(KEYS))
     m.load_needs(str(NEEDS))
+    m.load_popen(str(POPEN))
     m.load_disp(str(DISP))
     for f in list(REPO.glob("sqlglot/**/*.py")) + list(REPO.glob("tests/**/*.py")):
         m.sources[str(f.relative_to(REPO))] = f.read_text()
@@ -338,6 +437,7 @@ def main() -> None:
         m._old_graph = pre["graph"]
         if pre.get("state") is not None:
             _origin_state["base"] = pre["state"]
+        m._import_tables = dict(pre.get("import_tables") or {})
     else:
         log("no prebuilt data for this checkout")
 
@@ -430,7 +530,10 @@ def main() -> None:
                                [ids[t] for t in c.run], timeouts, str(TMP / f"res_{c.id}.json"),
                                subsets={ids[t]: v for t, v in c.subsets.items()},
                                duck=str(DUCK) if c.duck and DUCK.exists() else None,
-                               lazy={ids[t] for t in m.subtasks if t in ids},
+                               # raise-mode tests wait() on all futures before reading
+                               # them: a lazy one would never finish
+                               lazy={ids[t] for t in m.subtasks if t in ids and t not in m.subtask_raise},
+                               raising={ids[t] for t in m.subtask_raise if t in ids},
                                costs={ids[t]: (cm.test_cpu(t), ms[t]) for t in c.run},
                                listed=[ms[t] for t in c.report])
                 except BaseException as e:  # noqa: BLE001

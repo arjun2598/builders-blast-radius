@@ -26,19 +26,41 @@ class Selection:
     import_probe: dict = field(default_factory=dict)  # path -> function lines run at import time
 
 
+def load_map(path: str, cache: str | None = None) -> dict:
+    """The decoded map: from cache (a pickle written at image build by
+    blast.prebuild, used only if made from these exact bytes) or the JSON."""
+    raw = open(path, "rb").read()
+    if cache:
+        import hashlib
+        import pickle
+
+        try:
+            with open(cache, "rb") as fh:
+                sha, m = pickle.load(fh)
+            if sha == hashlib.sha256(raw).hexdigest():
+                return m
+        except (OSError, pickle.PickleError, EOFError, ValueError, TypeError):
+            pass
+    return json.loads(gzip.decompress(raw))
+
+
 class Map:
-    def __init__(self, path: str, tests: list[dict]):
-        with gzip.open(path, "rt") as fh:
-            m = json.load(fh)
+    def __init__(self, path: str, tests: list[dict], cache: str | None = None):
+        m = load_map(path, cache)
         self.lines = m["lines"]
         self.imports = {f: set(ls) for f, ls in m["import"].items()}
         self.users = m["users"]
         self.opens = m["opens"]
         self.lists = m["lists"]
-        self.popen = set(m["popen"])
+        self.popen = set(m["popen"])  # of the commit being selected (see popen_for)
+        self.popen_all = set(self.popen)  # tests that start subprocesses
+        self._ctx_cache: dict = {}  # path -> Ctx of the pinned source
+        self._import_tables: dict = {}  # path -> import_table of the pinned source (prebuilt)
+        self.popen_mods: dict[int, set[str]] = {}  # their subprocesses' sqlglot modules, set by load_popen
         self.classes = m.get("classes", {})
         self.hooks = m.get("hooks", {})
         self.subtasks = {int(k): v for k, v in m.get("subtasks", {}).items()}
+        self.subtask_raise = set(m.get("subtask_raise", ()))  # skipped tasks raise SkippedTask (see runner)
         self.cmp: cmpcheck.CmpMap | None = None  # comparison operands, set by the caller
         self.keys: cmpcheck.KeyMap | None = None  # dict keys read, set by the caller
         self.needs: dict | None = None  # module file -> tests that imported it, set by load_needs
@@ -125,6 +147,71 @@ class Map:
         d["mro"] = {g: set(b) for g, b in d["mro"].items()}
         self.disp = d
 
+    def import_table(self, f: str):
+        """(modules f star-imports, {name: modules f imports it from}) of the
+        pinned source; None stands for a module that can't be resolved."""
+        if f not in self._import_tables:
+            star, src, bound = set(), {}, set()
+            try:
+                tree = ast.parse(self.sources[f])
+            except SyntaxError:
+                star.add(None)
+                tree = None
+            for node in ast.walk(tree) if tree is not None else ():
+                if isinstance(node, ast.ImportFrom):
+                    mod = _abs_module(f, node)
+                    for a in node.names:
+                        if a.name == "*":
+                            star.add(mod)
+                        else:
+                            src.setdefault(a.asname or a.name, set()).add(mod)
+                            bound.add(f"{mod}.{a.name}" if mod else None)
+                elif isinstance(node, ast.Import):
+                    bound |= {a.name for a in node.names}
+            self._import_tables[f] = (star, src, bound)
+        return self._import_tables[f]
+
+    def names_module(self, f: str, owners: set[str]) -> bool:
+        """Can code in f get hold of one of these module objects: by
+        importing it, by importing a package above it and reading the
+        submodule attribute, or by loading modules dynamically?"""
+        text = self.sources.get(f, "")
+        if not f.endswith(".py") or _modname(f) in owners or _DYNAMIC_MODULE.search(text):
+            return True
+        _, _, bound = self.import_table(f)
+        if None in bound or bound & owners:
+            return True
+        for o in owners:
+            parts = o.split(".")
+            for i in range(1, len(parts)):
+                if ".".join(parts[:i]) in bound and re.search(rf"\.{re.escape(parts[i])}\b", text):
+                    return True
+        return False
+
+    def load_popen(self, path: str) -> None:
+        try:
+            with open(path) as fh:
+                self.popen_mods = {int(k): set(v) for k, v in json.load(fh).items()}
+        except (OSError, ValueError):
+            self.popen_mods = {}
+
+    def popen_for(self, changed: list[str]) -> set[int]:
+        """Tests with subprocesses that can see the change: the coverage map
+        can't follow them, so all of them unless the change is sqlglot code
+        their subprocesses don't load (recorded at the pinned commit, plus
+        whatever those modules import after the patch)."""
+        if not self.popen_mods or not all(f.startswith("sqlglot/") and f.endswith(".py") for f in changed):
+            return set(self.popen_all)
+        g, og = self.import_graph(), self.old_import_graph()
+        if g.bad or og.bad:
+            return set(self.popen_all)
+        out = set()
+        for t in self.popen_all:
+            mods = self.popen_mods.get(t)
+            if mods is None or (g.closure(mods) | og.closure(mods)) & set(changed):
+                out.add(t)
+        return out
+
     def load_needs(self, path: str) -> None:
         try:
             with gzip.open(path, "rt") as fh:
@@ -210,6 +297,14 @@ class Map:
             if lines:
                 out |= self.line_tests(x, lines) if x.startswith("sqlglot/") else set(self.by_file.get(x, ()))
         return out
+
+    @staticmethod
+    def drop_tasks_of(tests: set[int], mapped, kept: set[int]) -> set[int]:
+        """Tests minus the single pool tasks of mapped tests that were judged
+        unaffected as a whole (not in kept): a task does part of its test's
+        work, so it can't see what the whole test didn't."""
+        return {t for t in tests
+                if t < 10_000_000 or t in mapped or (n := (t - 10_000_000) // 1000) in kept or n not in mapped}
 
     def all_subtasks(self) -> set[int]:
         return {10_000_000 + n * 1000 + i for n, k in self.subtasks.items() for i in range(k)}
@@ -341,6 +436,7 @@ def select(diffs: list[FileDiff], old: dict, new: dict, m: Map) -> Selection:
         for p in fd_old:
             m.new_sources[p] = None
     m._graph = None
+    m.popen = m.popen_for(list(m.new_sources))
     for fd in diffs:
         sub = Selection()
         _select_file(fd, old.get(fd.old_path) if fd.old_path else None,
@@ -504,10 +600,16 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
                     sel.tests |= m.file_users(f)
         sel.notes.append(f"resolver over budget for {path}: broad fallback")
         g = m.import_graph()
-        if path in g.eager or path in m.old_import_graph().eager or g.bad:
-            # loaded by `import sqlglot`: the change may break or alter that
-            # import, which every test goes through
+        if g.bad:
             sel.everything = True
+            return
+        if (path in g.eager or path in m.old_import_graph().eager) and path not in m.import_ok:
+            # loaded by `import sqlglot`: the change may break or alter that
+            # import, which every test goes through, unless the import-state
+            # probe finds the patched import leaves the same state
+            sel.everything = True
+            if path.startswith("sqlglot/"):
+                sel.import_probe.setdefault(path, set())
             sel.notes.append(f"{path} is imported by sqlglot itself: every test")
             return
         if _bounded_by_imports(fd, m):
@@ -544,7 +646,7 @@ def _narrow_compare(fd: FileDiff, edit, m: Map, sel: Selection) -> None:
         sel.everything = False
     else:
         base = set(sel.tests)
-    sel.tests = (base - safe) | set(m.opens.get(fd.path, ()))
+    sel.tests = m.drop_tasks_of(base - safe, m.cmp.mapped, base - safe) | set(m.opens.get(fd.path, ()))
     sel.notes.append(f"comparison edit {fd.path}:{edit.site[0]} {edit.op_old}->{edit.op_new}: "
                      f"{len(base)} -> {len(sel.tests)}")
 
@@ -610,6 +712,17 @@ def _resolve_change(fd, tree, new_tree, ctx, res, m, sel) -> None:
                 node.lineno <= r <= node.end_lineno for r in removed
             ):
                 continue  # an edited simple statement: its removed lines already cover it
+            new_node = new_st.innermost(line)
+            if node is not None and new_node is not None and not hasattr(new_node, "body"):
+                # a simple statement replacing simple statements removed right
+                # after the anchor: it runs where they ran, and their removed
+                # lines are resolved already
+                run, r = [], (node.end_lineno or node.lineno) + 1
+                while r in removed:
+                    run.append(r)
+                    r += 1
+                if run and all((x := ctx.st.innermost(q)) is not None and not hasattr(x, "body") for q in run):
+                    continue
             if ctx.scopes.cls(old_line) is not None and ctx.scopes.func(old_line) is None:
                 new_node = new_st.innermost(line)
                 t = _targets(new_node) if new_node is not None else None
@@ -675,6 +788,28 @@ def _bound_names(tree: ast.AST) -> set[str]:
     return out
 
 
+def _modname(path: str) -> str:
+    return path[:-3].replace("/", ".").removesuffix(".__init__")
+
+
+def _abs_module(path: str, node: ast.ImportFrom) -> str | None:
+    if not node.level:
+        return node.module
+    pkg = _modname(path) if path.endswith("__init__.py") else _modname(path).rpartition(".")[0]
+    parts = pkg.split(".")
+    if node.level - 1 > len(parts):
+        return None
+    base = ".".join(parts[: len(parts) - (node.level - 1)])
+    return f"{base}.{node.module}" if node.module else base
+
+
+_STAR_IMPORT = re.compile(r"^\s*from\s+\S+\s+import\s+\*", re.M)
+_LAZY_PACKAGE = re.compile(r"^def __getattr__\(|import_module\(", re.M)
+
+# ways to reach a module object without naming it
+_DYNAMIC_MODULE = re.compile(r"import_module|__import__|sys\.modules|globals\(\)|vars\(|pkgutil|importlib")
+
+
 class Ctx:
     """Parsed view of one source file."""
 
@@ -688,15 +823,47 @@ class Ctx:
         self._names: dict[str, list[int]] | None = None
         self.imports_from: dict[str, str] = {}  # local alias -> imported name
         self.import_lines: dict[str, list[int]] = {}  # local alias -> lines of its `from` imports
+        self.import_src: dict[str, set] = {}  # local alias -> modules it is imported from (None: unknown)
         self.star = False
+        self.star_src: set = set()
         for node in ast.walk(self.tree):
             if isinstance(node, ast.ImportFrom):
+                src_mod = _abs_module(path, node)
                 for a in node.names:
                     if a.name == "*":
                         self.star = True
+                        self.star_src.add(src_mod)
                     else:
                         self.imports_from[a.asname or a.name] = a.name
                         self.import_lines.setdefault(a.asname or a.name, []).append(node.lineno)
+                        self.import_src.setdefault(a.asname or a.name, set()).add(src_mod)
+
+    def foreign_attr_lines(self, name: str, owners: set[str]) -> set[int]:
+        """Lines whose every `X.name` read is on a name X bound by importing
+        a module that is neither one of `owners` nor a package above one."""
+        if not hasattr(self, "_mod_alias"):
+            self._mod_alias: dict[str, set] = {}
+            for n in ast.walk(self.tree):
+                if isinstance(n, ast.Import):
+                    for a in n.names:
+                        self._mod_alias.setdefault(a.asname or a.name.split(".")[0], set()).add(
+                            a.name if a.asname else a.name.split(".")[0])
+                elif isinstance(n, ast.ImportFrom):
+                    mod = _abs_module(self.path, n)
+                    for a in n.names:
+                        self._mod_alias.setdefault(a.asname or a.name, set()).add(f"{mod}.{a.name}" if mod else None)
+                elif isinstance(n, (ast.Name, ast.arg)) and isinstance(getattr(n, "ctx", ast.Store()), ast.Store):
+                    # rebound elsewhere: can't tell what it holds
+                    self._mod_alias.setdefault(n.id if isinstance(n, ast.Name) else n.arg, set()).add(None)
+        def related(mods):
+            return any(x is None or any(o == x or o.startswith(x + ".") for o in owners) for x in mods)
+        ok: dict[int, bool] = {}
+        for n in ast.walk(self.tree):
+            if isinstance(n, ast.Attribute) and n.attr == name:
+                v = n.value
+                foreign = isinstance(v, ast.Name) and v.id in self._mod_alias and not related(self._mod_alias[v.id])
+                ok[n.lineno] = ok.get(n.lineno, True) and foreign
+        return {l for l, f in ok.items() if f}
 
     def name_refs(self, name: str) -> list[int]:
         """Lines that read the bare name."""
@@ -725,7 +892,7 @@ class Ctx:
 
 MAX_DEPTH = 4
 MAX_LINES = int(os.environ.get("BLAST_RESOLVE_LINES", "300"))
-MAX_SECONDS = float(os.environ.get("BLAST_RESOLVE_SECONDS", "0.4"))
+MAX_SECONDS = float(os.environ.get("BLAST_RESOLVE_SECONDS", "1.0"))
 
 
 class OverBudget(Exception):
@@ -744,6 +911,7 @@ class Resolver:
         self.removed_names: set[str] = set()
         self.added_names: set[str] = set()
         self._done: set = set()
+        self._cache: dict = {}
         self.touched: set[str] = set()  # module/class-level names followed so far
         self._lines = 0
         import time
@@ -770,6 +938,38 @@ class Resolver:
         self.sel.notes.append(f"{why}: {len(hit)} tests import it")
         return True
 
+    def exporters(self, path: str, name: str) -> set[str]:
+        """Modules through which `name` of module `path` can be reached: the
+        module itself, those that star-import it or import the name from one
+        of these (re-exports), and packages above them that hand out
+        submodule attributes from a module-level __getattr__."""
+        key = ("exporters", path, name)
+        if key in self._cache:
+            return self._cache[key]
+        m = self.m
+        word = re.compile(rf"\b{re.escape(name)}\b")
+        files = [f for f, t in m.sources.items() if f.endswith(".py") and (_STAR_IMPORT.search(t) or word.search(t))]
+        lazy = [f for f, t in m.sources.items() if f.endswith("__init__.py") and _LAZY_PACKAGE.search(t)]
+        out = {_modname(path)}
+        grew = True
+        while grew:
+            grew = False
+            for f in lazy:
+                pkg = _modname(f)
+                if pkg not in out and any(o.startswith(pkg + ".") for o in out):
+                    out.add(pkg)
+                    grew = True
+            for f in files:
+                mod = _modname(f)
+                if mod in out:
+                    continue
+                star_src, src, _ = m.import_table(f)
+                if star_src & (out | {None}) or src.get(name, set()) & (out | {None}):
+                    out.add(mod)
+                    grew = True
+        self._cache[key] = out
+        return out
+
     def _tick(self) -> None:
         import time
 
@@ -782,10 +982,14 @@ class Resolver:
             text = src if src is not None else self.m.sources.get(path)
             if text is None:
                 return None
-            try:
-                self._ctx[path] = Ctx(path, text)
-            except SyntaxError:
-                return None
+            # contexts of pinned sources are kept across commits (read-only)
+            shared = self.m._ctx_cache if text == self.m.sources.get(path) else {}
+            if path not in shared:
+                try:
+                    shared[path] = Ctx(path, text)
+                except SyntaxError:
+                    return None
+            self._ctx[path] = shared[path]
         return self._ctx[path]
 
     # -- fallbacks -------------------------------------------------------
@@ -951,6 +1155,7 @@ class Resolver:
             if de is not None and de[0] == qual and de[1] == a:
                 narrowed = cmpcheck.key_readers(m.keys, path, qual, a, de[2], readers)
                 if narrowed is not None:
+                    narrowed = m.drop_tasks_of(narrowed, m.keys.mapped, narrowed)
                     sel.notes.append(f"dict entry {a}[{de[2][:30]}]: {len(readers)} -> {len(narrowed)} readers")
                     readers = narrowed
             sel.tests |= readers
@@ -1019,29 +1224,58 @@ class Resolver:
                 if node is not None and id(node) in skip:
                     continue
                 self.line(path, ctx, l, depth + 1)
-            # other files: imports of the name, star-imports, attribute and string access
+            # other files: imports of the name, star-imports, attribute and
+            # string access, from this module or one that re-exports the name
             word = re.compile(rf"\b{re.escape(name)}\b")
             attr = re.compile(rf"\.{re.escape(name)}\b|[\"']{re.escape(name)}[\"']")
+            dot = re.compile(rf"\.{re.escape(name)}\b")
+            owners = self.exporters(path, name)
             for f, text in m.sources.items():
                 if f == path or not word.search(text):
                     continue
+                reach = m.names_module(f, owners)
+                if f.endswith(".py"):
+                    # cheap checks first: most files that use the word don't
+                    # import it from here and can't name this module
+                    star_src, src, _ = m.import_table(f)
+                    imported = any(src.get(al, set()) & (owners | {None}) for al in src)
+                    if not (imported or star_src & (owners | {None}) or reach):
+                        continue
                 fctx = self.ctx(f)
                 if fctx is None:
                     continue
-                aliases = {al for al, orig in fctx.imports_from.items() if orig == name}
+                aliases = {al for al, orig in fctx.imports_from.items() if orig == name
+                           and fctx.import_src.get(al, {None}) & (owners | {None})}
+                star = fctx.star and bool(fctx.star_src & (owners | {None}))
                 if name in self.removed_names and aliases:
                     # `from x import name` of a name that is gone fails at import
                     if self.import_break(f, f"{f} imports removed name {name}", fctx, aliases):
                         continue
                     raise OverBudget()
-                if fctx.star:
+                if star:
                     aliases.add(name)
                 for al in aliases:
                     for l in fctx.name_refs(al):
                         self.line(f, fctx, l, depth + 1)
+                if not reach:
+                    continue
+                broke = False
+                foreign = fctx.foreign_attr_lines(name, owners)
                 for i, l in enumerate(fctx.lines, 1):
-                    if attr.search(l):
-                        self.line(f, fctx, i, depth + 1)
+                    if not attr.search(l):
+                        continue
+                    if i in foreign and not re.search(rf"[\"']{re.escape(name)}[\"']", l):
+                        continue  # e.g. t.Iterator for typing's Iterator
+                    if name in self.removed_names and fctx.scopes.func(i) is None and (dot.search(l) or "getattr" in l):
+                        # read while f is imported (module level, class body):
+                        # importing f now fails
+                        if not self.import_break(f, f"{f} reads removed name {name} at import", fctx):
+                            raise OverBudget()
+                        broke = True
+                        break
+                    self.line(f, fctx, i, depth + 1)
+                if broke:
+                    continue
         self.sel.notes.append(f"module names {path} {sorted(names)[:4]}")
 
 

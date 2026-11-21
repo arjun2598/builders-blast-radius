@@ -80,7 +80,19 @@ def main(tests_json, out, jobs="8", split=""):
     print(f"done {done} in {time.time() - t0:.0f}s, failed: {failed[:10]} ({len(failed)})", flush=True)
 
 
-SPLIT_MIN_SECONDS = 3.0
+SPLIT_MIN_SECONDS = float(os.environ.get("MAP_SPLIT_MIN", "3.0"))
+# comma-separated test numbers: split only these (added to an existing split dir)
+SPLIT_ONLY = {int(x) for x in os.environ.get("MAP_SPLIT_ONLY", "").split(",") if x}
+
+
+class _Tolerant(unittest.TestResult):
+    """Passes a test whose only failures are subTests that got a skipped
+    task's result (SkippedTask); never stops at the first one."""
+
+    def addSubTest(self, test, subtest, err):
+        if err is not None and err[0].__name__ == "SkippedTask":
+            return
+        super().addSubTest(test, subtest, err)
 
 
 def split_tests(tests, modules, out, jobs):
@@ -91,20 +103,27 @@ def split_tests(tests, modules, out, jobs):
     reaches. Writes n<number>.json with the count and whether that held."""
     jobs_out = []
     for t in tests:
-        if t["seconds"] < SPLIT_MIN_SECONDS:
+        if (SPLIT_ONLY and t["number"] not in SPLIT_ONLY) or (not SPLIT_ONLY and t["seconds"] < SPLIT_MIN_SECONDS):
             continue
-        pid = os.fork()
-        if pid == 0:
-            mapper._tasks["only"] = -1
-            ok = run_one(t, modules, out, dump=False) == 0
-            with open(os.path.join(out, f"n{t['number']:05d}.json"), "w") as fh:
-                json.dump({"ntasks": mapper._tasks["n"], "ok": ok}, fh)
-            os._exit(0)
-        os.waitpid(pid, 0)
-        info = json.load(open(os.path.join(out, f"n{t['number']:05d}.json")))
+        info = None
+        # skipped tasks give None if the test copes with that, else raise
+        # SkippedTask into the subTest that uses the result
+        for mode in ("none", "raise"):
+            pid = os.fork()
+            if pid == 0:
+                mapper._tasks["only"] = -1
+                mapper._tasks["raise"] = mode == "raise"
+                ok = run_one(dict(t, mode=mode), modules, out, dump=False) == 0
+                with open(os.path.join(out, f"n{t['number']:05d}.json"), "w") as fh:
+                    json.dump({"ntasks": mapper._tasks["n"], "ok": ok, "mode": mode}, fh)
+                os._exit(0)
+            os.waitpid(pid, 0)
+            info = json.load(open(os.path.join(out, f"n{t['number']:05d}.json")))
+            if info["ok"]:
+                break
         print(t["id"], info, flush=True)
-        if info["ok"] and info["ntasks"] >= 2:
-            jobs_out += [dict(t, task=i) for i in range(info["ntasks"])]
+        if info["ok"] and 2 <= info["ntasks"] < 1000:
+            jobs_out += [dict(t, task=i, mode=info["mode"]) for i in range(info["ntasks"])]
     return jobs_out
 
 
@@ -113,6 +132,8 @@ def run_one(t, modules, out, dump=True):
     task = t.get("task")
     if task is not None:
         mapper._tasks["only"] = task
+    if t.get("mode") == "raise":
+        mapper._tasks["raise"] = True
     path, cls_name, meth = nodeid.split("::")
     module = modules[path[:-3].replace("/", ".")]
     # drop what the parent recorded so this child dumps only its own test
@@ -123,7 +144,7 @@ def run_one(t, modules, out, dump=True):
     os.dup2(devnull, 2)
     mapper._switch(nodeid + (f"#task{task}" if task is not None else "") + "\0c")
     suite = unittest.TestSuite([getattr(module, cls_name)(meth)])
-    result = unittest.TestResult()
+    result = _Tolerant() if t.get("mode") == "raise" else unittest.TestResult()
     suite.run(result)
     mapper._switch("")
     if not dump:

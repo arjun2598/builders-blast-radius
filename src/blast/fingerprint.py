@@ -2,12 +2,14 @@
 
 python -m blast.fingerprint <repo> <request.json>
 
-request.json: {"files": {rel path: new text or null}, "watch": {rel path: [lines]}}
+request.json: {"files": {rel path: new text or null}, "watch": {rel path: [lines]},
+               "skip": [module names not to import, with their submodules]}
 
 Imports every sqlglot module (patched texts replace the files named in
 "files"; the rest load from <repo> as usual, cached bytecode included), then
 prints JSON {"fp": {"<module>:<name>": digest}, "ran": {rel path: [lines of
-"watch" that executed]}, "errors": [modules that failed to import]}.
+"watch" that executed]}, "errors": [modules that failed to import], "loaded": [sqlglot modules
+imported in the end]}.
 
 The digest of a value covers everything import-time code could have
 computed into it: literals, containers, object state, function defaults and
@@ -214,17 +216,31 @@ def main(repo: str, req_path: str) -> None:
         mon.register_callback(tool, mon.events.LINE, on_line)
         mon.set_events(tool, mon.events.LINE)
     errors = []
+    skip = set(req.get("skip", ()))
     import sqlglot
 
-    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
-        if info.name == "sqlglot.__main__":
-            continue
+    if skip:
+        # from the file list: walk_packages would import skipped packages
+        names = set()
+        for dirpath, _, fnames in os.walk(root):
+            for fn in fnames:
+                if fn.endswith(".py"):
+                    rel = os.path.relpath(os.path.join(dirpath, fn), repo)
+                    names.add(rel[:-3].replace(os.sep, ".").removesuffix(".__init__"))
+        names |= {f[:-3].replace("/", ".").removesuffix(".__init__") for f, t in files.items()
+                  if t is not None and f.startswith("sqlglot/") and f.endswith(".py")}
+        walk = [n for n in sorted(names) if n != "sqlglot.__main__"
+                and not any(n == k or n.startswith(k + ".") for k in skip)]
+    else:
+        walk = [info.name for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot.")
+                if info.name != "sqlglot.__main__"]
+    for name in walk:
         try:
-            importlib.import_module(info.name)
+            importlib.import_module(name)
         except Exception:  # noqa: BLE001
-            errors.append(info.name)
+            errors.append(name)
     # modules the patch adds are not found by the walk above if their package is new
-    for rel, text in files.items():
+    for rel, text in files.items() if not skip else ():
         if text is not None and rel.startswith("sqlglot/") and rel.endswith(".py"):
             name = rel[:-3].replace("/", ".").removesuffix(".__init__")
             if name not in sys.modules:
@@ -237,7 +253,8 @@ def main(repo: str, req_path: str) -> None:
         mon.free_tool_id(tool)
     fp = snapshot()
     rel_ran = {os.path.relpath(f, repo): sorted(ls) for f, ls in ran.items()}
-    sys.stdout.write(json.dumps({"fp": fp, "ran": rel_ran, "errors": sorted(errors)}))
+    loaded = sorted(n for n in sys.modules if n == "sqlglot" or n.startswith("sqlglot."))
+    sys.stdout.write(json.dumps({"fp": fp, "ran": rel_ran, "errors": sorted(errors), "loaded": loaded}))
 
 
 if __name__ == "__main__":

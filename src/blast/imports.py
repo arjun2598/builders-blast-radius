@@ -36,7 +36,72 @@ def _package(path: str) -> str:
     return d.replace("/", ".")
 
 
-def module_imports(path: str, src: str, files: set[str], sites: list | None = None) -> set[str] | None:
+def lazy_tables(sources: dict[str, str]) -> dict[str, dict]:
+    """Packages that hand out names from a module-level __getattr__ (lazy
+    loading): package module name -> {name: files it may load, "*": every
+    file any name may load}. Read from the package's dict literals
+    (name -> module path or submodule name) and its TYPE_CHECKING imports;
+    an f-string import under the package's own prefix may load any of its
+    submodules."""
+    files = set(sources)
+    out: dict[str, dict] = {}
+    for f, src in sources.items():
+        if not f.endswith("__init__.py") or "def __getattr__" not in src:
+            continue
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        if not any(isinstance(n, ast.FunctionDef) and n.name == "__getattr__" for n in tree.body):
+            continue
+        pkg = f[: -len("/__init__.py")].replace("/", ".")
+        table: dict[str, set[str]] = {}
+        everything: set[str] = set()
+
+        def target(sv: str) -> str | None:
+            return _module_path(sv, files) or _module_path(f"{pkg}.{sv}", files)
+
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Dict):
+                for k, v in zip(n.keys, n.values):
+                    if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                        ts = {t for c in ast.walk(v) if isinstance(c, ast.Constant) and isinstance(c.value, str)
+                              for t in [target(c.value)] if t}
+                        if ts:
+                            table.setdefault(k.value, set()).update(ts)
+                            everything |= ts
+            elif isinstance(n, ast.If) and _is_type_checking(n.test):
+                for st in ast.walk(n):
+                    if isinstance(st, ast.ImportFrom) and st.module and not st.level:
+                        t = _module_path(st.module, files)
+                        if t:
+                            for a in st.names:
+                                table.setdefault(a.asname or a.name, set()).add(t)
+                            everything.add(t)
+            elif isinstance(n, ast.Call) and getattr(n.func, "attr", getattr(n.func, "id", None)) == "import_module" \
+                    and n.args and isinstance(n.args[0], ast.JoinedStr):
+                head = "".join(str(v.value) for v in n.args[0].values[:1] if isinstance(v, ast.Constant))
+                if head.startswith(pkg + "."):
+                    everything |= {x for x in files if x.startswith(pkg.replace(".", "/") + "/") and x.endswith(".py")}
+        # names the package binds itself never reach __getattr__
+        for st in tree.body:
+            names = []
+            if isinstance(st, (ast.Assign, ast.AnnAssign)):
+                for t in (st.targets if isinstance(st, ast.Assign) else [st.target]):
+                    names += [x.id for x in ast.walk(t) if isinstance(x, ast.Name)]
+            elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.append(st.name)
+            elif isinstance(st, (ast.Import, ast.ImportFrom)):
+                names += [a.asname or a.name.split(".")[0] for a in st.names if a.name != "*"]
+            for x in names:
+                table[x] = set()
+        table["*"] = everything
+        out[pkg] = table
+    return out
+
+
+def module_imports(path: str, src: str, files: set[str], sites: list | None = None,
+                   lazy: dict | None = None) -> set[str] | None:
     """Files that importing `path` imports at module level (class bodies
     included, function bodies and TYPE_CHECKING blocks not). None if the
     source does not parse. Imports inside functions go to `sites` as
@@ -92,6 +157,9 @@ def module_imports(path: str, src: str, files: set[str], sites: list | None = No
                     sub = _module_path(f"{mod}.{a.name}", files) or _module_path(f"{mod}.{a.name.lower()}", files)
                     if sub:
                         out.add(sub)
+                    elif lazy and mod in lazy and a.name != "*":
+                        # handed out by the package's __getattr__
+                        out.update(lazy[mod][a.name] if a.name in lazy[mod] else lazy[mod]["*"])
             elif isinstance(st, ast.If):
                 if not _is_type_checking(st.test):
                     walk(st.body)
@@ -146,13 +214,15 @@ class Graph:
         self.deps: dict[str, set[str]] = {}
         self.bad = False
         self.sites: dict[str, list] = {}  # file -> [(line, imported files)] inside functions
-        redo = set(sources) if base is None or base.files != self.files else set(changed)
+        self.lazy = lazy_tables(sources)
+        redo = set(sources) if base is None or base.files != self.files or getattr(base, "lazy", None) != self.lazy \
+            else set(changed)
         for f, src in sources.items():
             if f not in redo and f in base.deps:
                 self.deps[f], self.sites[f] = base.deps[f], base.sites[f]
                 continue
             self.sites[f] = []
-            d = module_imports(f, src, self.files, self.sites[f])
+            d = module_imports(f, src, self.files, self.sites[f], self.lazy)
             if d is None:
                 self.bad = True
                 d = set()

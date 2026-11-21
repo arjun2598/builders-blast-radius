@@ -69,7 +69,13 @@ def _switch(key):
 _types: dict = {}  # key -> set of sqlglot types instantiated
 
 
-_tasks = {"n": 0, "only": None}  # pool tasks submitted so far; run only this one
+_tasks = {"n": 0, "only": None, "raise": False}  # pool tasks submitted so far; run only this one
+
+
+class SkippedTask(Exception):
+    """Result of a pool task skipped in split mode, for tests that use every
+    result inside a subTest (fixture loops): that subTest fails with this
+    and the others go on."""
 
 
 class _SyncExecutor:
@@ -89,7 +95,11 @@ class _SyncExecutor:
         n = _tasks["n"]
         _tasks["n"] = n + 1
         if _tasks["only"] is not None and n != _tasks["only"]:
-            fut.set_result(None)  # skipped task, see mapper_fork split mode
+            # skipped task, see mapper_fork split mode
+            if _tasks["raise"]:
+                fut.set_exception(SkippedTask())
+            else:
+                fut.set_result(None)
             return fut
         outer = _key
         if outer and os.environ.get("MAP_TASKS") == "1":

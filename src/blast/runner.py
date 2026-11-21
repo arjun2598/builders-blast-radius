@@ -26,7 +26,7 @@ import unittest
 # (None = all). A skipped task's future yields None; see Map.subtasks.
 # lazy: run a task when its result is first asked for, so a test that
 # checks results in order and fails early (with failfast) skips the rest.
-_tasks: dict = {"n": 0, "only": None, "lazy": False}
+_tasks: dict = {"n": 0, "only": None, "lazy": False, "raise": False}
 
 
 def _call(blob):
@@ -59,6 +59,12 @@ def _lazy_future(blob):
     return LazyFuture()
 
 
+class SkippedTask(Exception):
+    """Result of a pool task the map says can't see the change, for tests
+    that use each result inside a subTest: that subTest ends with this and
+    counts for nothing; the others run as usual."""
+
+
 class SyncExecutor:
     """Replaces ProcessPoolExecutor: the work runs in this process (no spawned
     interpreters to pay for) but still crosses pickle, so pickling bugs still
@@ -75,7 +81,10 @@ class SyncExecutor:
         n = _tasks["n"]
         _tasks["n"] = n + 1
         if _tasks["only"] is not None and n not in _tasks["only"]:
-            fut.set_result(None)
+            if _tasks["raise"]:
+                fut.set_exception(SkippedTask())
+            else:
+                fut.set_result(None)
             return fut
         try:
             blob = pickle.dumps((fn, args, kwargs))
@@ -133,10 +142,11 @@ def _pack_cost(ms: list[int]) -> float:
 
 class Result(unittest.TestResult):
     def __init__(self, ids: dict, timeouts: dict, stop_first: bool, subsets: dict | None = None,
-                 lazy: set | None = None):
+                 lazy: set | None = None, raising: set | None = None):
         super().__init__()
         self.subsets = subsets or {}
         self.lazy = lazy or set()
+        self.raising = raising or set()  # nodeids whose skipped tasks raise SkippedTask
         # a failed subtest ends its test at once: the test already counts as
         # failed, the rest of it would only cost CPU
         self.failfast = stop_first
@@ -199,11 +209,16 @@ class Result(unittest.TestResult):
         sub = self.subsets.get(self.ids.get(id(test)))
         _tasks["n"], _tasks["only"] = 0, (set(sub) if sub is not None else None)
         _tasks["lazy"] = self.ids.get(id(test)) in self.lazy
+        _tasks["raise"] = sub is not None and self.ids.get(id(test)) in self.raising
+        # skipped tasks fail their subTests on purpose: fail-fast would end
+        # the test at the first of them
+        self.failfast = self.stop_first and not _tasks["raise"]
         signal.setitimer(signal.ITIMER_REAL, self.timeouts.get(self.ids.get(id(test)), 30.0))
 
     def stopTest(self, test):
         signal.setitimer(signal.ITIMER_REAL, 0)
-        _tasks["n"], _tasks["only"], _tasks["lazy"] = 0, None, False
+        _tasks["n"], _tasks["only"], _tasks["lazy"], _tasks["raise"] = 0, None, False, False
+        self.failfast = self.stop_first
         nid = self.ids.get(id(test))
         if nid:
             self.done.add(nid)
@@ -216,7 +231,8 @@ class Result(unittest.TestResult):
         self._fail(test)
 
     def addSubTest(self, test, subtest, err):
-        if err is not None:
+        if err is not None and not (_tasks["raise"] and issubclass(err[0], SkippedTask)):
+            self.failfast = self.stop_first  # a real failure ends the test again
             self._fail(test)
 
     def addUnexpectedSuccess(self, test):
@@ -238,7 +254,8 @@ def _repoint(workdir: str, origin: str) -> None:
 def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
         timeouts: dict[str, float], out_path: str, stop_first: bool = True,
         subsets: dict[str, list[int]] | None = None, duck: str | None = None,
-        lazy: set[str] | None = None, costs: dict | None = None, listed: list[int] | None = None) -> None:
+        lazy: set[str] | None = None, costs: dict | None = None, listed: list[int] | None = None,
+        raising: set[str] | None = None) -> None:
     """subsets: nodeid -> the only pool tasks to run (the map says no other
     task can see the change). duck: recorded DuckDB answers to reuse."""
     os.chdir(workdir)
@@ -288,7 +305,7 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
         order.setdefault(parts[0], {}).setdefault(parts[1], []).append((nid, parts[2]))
 
     ids: dict[int, str] = {}
-    result = Result(ids, timeouts, stop_first, subsets, lazy)
+    result = Result(ids, timeouts, stop_first, subsets, lazy, raising)
     result.costs = costs or {}
     result.listed = list(listed or ())
     failed: set[str] = set()
