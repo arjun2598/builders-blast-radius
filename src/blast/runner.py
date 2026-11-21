@@ -112,6 +112,25 @@ def _alarm(signum, frame):
     raise TestTimeout("test timed out")
 
 
+CONTINUE_SHARE = float(os.environ.get("BLAST_CONTINUE", "1.0"))
+
+
+def _pack_cost(ms: list[int]) -> float:
+    """Simulated seconds of listing tests of these durations (ms), packed
+    greedily on the best number of workers (2 s each, at most 8)."""
+    if not ms:
+        return 0.0
+    order = sorted(ms, reverse=True)
+    best = None
+    for k in range(1, min(8, len(order)) + 1):
+        loads = [0] * k
+        for x in order:
+            loads[loads.index(min(loads))] += x
+        c = max(loads) + 2000 * k
+        best = c if best is None or c < best else best
+    return best / 1000
+
+
 class Result(unittest.TestResult):
     def __init__(self, ids: dict, timeouts: dict, stop_first: bool, subsets: dict | None = None,
                  lazy: set | None = None):
@@ -124,6 +143,11 @@ class Result(unittest.TestResult):
         self.ids = ids  # id(TestCase) -> nodeid
         self.timeouts = timeouts
         self.stop_first = stop_first
+        self.costs: dict = {}  # nodeid -> (estimated CPU s, simulated ms)
+        self.listed: list[int] = []  # simulated ms of tests listed without running
+        self.file_failed: set[str] = set()  # test files with a failure: the rest of each is listed
+        self.stop_file = False
+        self.stop_all = False
         self.bad: set[str] = set()
         self.done: set[str] = set()
         self.class_errors: list[str] = []
@@ -134,8 +158,41 @@ class Result(unittest.TestResult):
             self.class_errors.append(str(test))
         else:
             self.bad.add(nid)
-        if self.stop_first:
+        if not self.stop_first:
+            return
+        if nid is None:
             self.stop()
+            return
+        self.file_failed.add(nid.split("::", 1)[0])
+        self.stop_file = True  # the rest of this file is listed, not run
+        if self._stop_all(nid):
+            self.stop_all = True
+        self.stop()
+
+    def _stop_all(self, nid) -> bool:
+        """After a failure (whose file's remaining tests get listed): also
+        stop, listing every other test not run yet, or keep running the other
+        files? Failures cluster by file, so other files pass at the rate seen
+        across files so far. Listing them costs the simulated time they add
+        on top of what is listed already; running costs their CPU."""
+        if not self.costs:
+            return True
+        here = nid.split("::", 1)[0]
+        left = [n for n in self.costs if n not in self.done and n != nid and n.split("::", 1)[0] != here
+                and n.split("::", 1)[0] not in self.file_failed]
+        if not left:
+            return False
+        same = [n for n in self.costs if n not in self.done and n.split("::", 1)[0] in self.file_failed]
+        cpu_left = sum(self.costs[n][0] for n in left)
+        listed = [self.costs[n][1] for n in self.bad | set(same) if n in self.costs] + self.listed
+        extra = _pack_cost(listed + [self.costs[n][1] for n in left]) - _pack_cost(listed)
+        # start from 4 imagined clean files
+        files_done = {n.split("::", 1)[0] for n in self.done} | self.file_failed
+        rate = len(self.file_failed) / (len(files_done) + 4)
+        if os.environ.get("BLAST_DEBUG_STOP"):
+            print(f"stop? {nid} left={len(left)} cpu_left={cpu_left:.2f} extra={extra:.2f} rate={rate:.2f} "
+                  f"listed={len(listed)}", file=sys.__stderr__)
+        return cpu_left >= CONTINUE_SHARE * extra * (1 - rate)
 
     def startTest(self, test):
         super().startTest(test)
@@ -181,7 +238,7 @@ def _repoint(workdir: str, origin: str) -> None:
 def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
         timeouts: dict[str, float], out_path: str, stop_first: bool = True,
         subsets: dict[str, list[int]] | None = None, duck: str | None = None,
-        lazy: set[str] | None = None) -> None:
+        lazy: set[str] | None = None, costs: dict | None = None, listed: list[int] | None = None) -> None:
     """subsets: nodeid -> the only pool tasks to run (the map says no other
     task can see the change). duck: recorded DuckDB answers to reuse."""
     os.chdir(workdir)
@@ -232,10 +289,17 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
 
     ids: dict[int, str] = {}
     result = Result(ids, timeouts, stop_first, subsets, lazy)
+    result.costs = costs or {}
+    result.listed = list(listed or ())
     failed: set[str] = set()
     for path, classes in order.items():
-        if result.shouldStop:
+        if result.stop_all:
             break
+        if result.shouldStop:  # only this file was given up on
+            result.shouldStop = False
+            result.stop_file = False
+        if path in result.file_failed:
+            continue
         members = [nid for cl in classes.values() for nid, _ in cl]
         if not path.endswith(".py"):
             failed.update(members)

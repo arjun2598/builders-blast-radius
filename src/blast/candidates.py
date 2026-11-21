@@ -23,6 +23,7 @@ class Selection:
     tests: set[int] = field(default_factory=set)
     everything: bool = False  # can't reason about it: every test is a candidate
     notes: list[str] = field(default_factory=list)
+    import_probe: dict = field(default_factory=dict)  # path -> function lines run at import time
 
 
 class Map:
@@ -40,6 +41,9 @@ class Map:
         self.subtasks = {int(k): v for k, v in m.get("subtasks", {}).items()}
         self.cmp: cmpcheck.CmpMap | None = None  # comparison operands, set by the caller
         self.keys: cmpcheck.KeyMap | None = None  # dict keys read, set by the caller
+        self.needs: dict | None = None  # module file -> tests that imported it, set by load_needs
+        self.needs_mapped: set[int] = set()
+        self.import_ok: set[str] = set()  # files whose import-time runs were checked to leave the same state
         attrs = m.get("attrs", {"sets": [], "attr": {}, "import": {}})
         self.attr_sets, self.attr_index, self.attr_import = attrs["sets"], attrs["attr"], attrs["import"]
         self.tests = tests
@@ -48,6 +52,95 @@ class Map:
         self.by_file: dict[str, list[int]] = {}
         for t in tests:
             self.by_file.setdefault(t["file"], []).append(t["number"])
+
+    def load_needs(self, path: str) -> None:
+        try:
+            with gzip.open(path, "rt") as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            return
+        self.needs_mapped = set(d.pop("__mapped__", ()))
+        self.needs = d
+
+    @property
+    def code_readers(self) -> set[int]:
+        """Tests in files that look at code objects, frames or source text,
+        where line numbers could show."""
+        if not hasattr(self, "_code_readers"):
+            pat = re.compile(r"__code__|co_\w+|getsource|f_lineno|tb_lineno|linecache|inspect\.|traceback\.extract")
+            out: set[int] = set()
+            for f, nums in self.by_file.items():
+                if pat.search(self.sources.get(f, "")) or f not in self.sources:
+                    out.update(nums)
+            self._code_readers = out
+        return self._code_readers
+
+    def import_graph(self):
+        """Static import graph of the patched tree (patched texts replace the
+        pinned ones for the changed files)."""
+        if getattr(self, "_graph", None) is None:
+            from . import imports
+
+            og = self.old_import_graph()
+            srcs = dict(self.sources)
+            changed = set()
+            for f, text in getattr(self, "new_sources", {}).items():
+                if f.endswith(".py") and f.startswith(("sqlglot/", "tests/")):
+                    srcs[f] = "" if text is None else text  # gone: importers still point at it
+                    changed.add(f)
+            g = imports.Graph(srcs, og, changed)
+            g.eager = g.closure(imports.EAGER_ROOTS)
+            g.dynamic = {f: (imports.dynamic_sites(f, t) if f in changed or f not in og.dynamic else og.dynamic[f])
+                         for f, t in srcs.items()}
+            self._graph = g
+        return self._graph
+
+    def old_import_graph(self):
+        if getattr(self, "_old_graph", None) is None:
+            from . import imports
+
+            g = imports.Graph(self.sources)
+            g.eager = g.closure(imports.EAGER_ROOTS)
+            g.dynamic = {f: imports.dynamic_sites(f, t) for f, t in self.sources.items()}
+            self._old_graph = g
+        return self._old_graph
+
+    def import_breakers(self, f: str) -> set[int] | None:
+        """Tests that import f, directly or through other modules, before or
+        after the patch: the only tests that can see anything f does, or
+        fail when importing it raises. None when that is every test (f is
+        imported by `import sqlglot`)."""
+        g = self.import_graph()
+        og = self.old_import_graph()
+        if g.bad or og.bad:
+            return None
+        imp = g.importers(f) | og.importers(f)
+        if imp & (g.eager | og.eager):
+            return None
+        out = set(self.popen)
+        for x in imp:
+            if x.startswith("sqlglot/"):
+                out |= self.file_users(x)
+                out |= _parent_lists(x, self)
+            else:
+                out |= set(self.by_file.get(x, ()))
+        if self.needs is not None:
+            # recorded: the modules each test imported or asked for while it ran
+            for x in imp:
+                out.update(self.needs.get(x, ()))
+            out |= {t["number"] for t in self.tests} - self.needs_mapped
+            return out
+        for x, sites in g.sites.items():
+            for line, tgt in sites:
+                if tgt & imp:
+                    out |= self.line_tests(x, [line]) if x.startswith("sqlglot/") else set(self.by_file.get(x, ()))
+        # dynamic imports that may name one of those modules
+        names = {x[:-3].replace("/", ".").removesuffix(".__init__") for x in imp}
+        for x, sites in g.dynamic.items():
+            lines = [l for ls, pre in sites if pre is None or any(n.startswith(p) for p in pre for n in names) for l in ls]
+            if lines:
+                out |= self.line_tests(x, lines) if x.startswith("sqlglot/") else set(self.by_file.get(x, ()))
+        return out
 
     def all_subtasks(self) -> set[int]:
         return {10_000_000 + n * 1000 + i for n, k in self.subtasks.items() for i in range(k)}
@@ -174,16 +267,38 @@ def _strip_docless(src: str) -> str | None:
 def select(diffs: list[FileDiff], old: dict, new: dict, m: Map) -> Selection:
     """old/new map path -> text (None if missing)."""
     sel = Selection()
+    m.new_sources = {fd.new_path or fd.old_path: (new.get(fd.new_path) if fd.new_path else None) for fd in diffs}
+    if fd_old := [fd.old_path for fd in diffs if fd.old_path and fd.old_path != fd.new_path]:
+        for p in fd_old:
+            m.new_sources[p] = None
+    m._graph = None
     for fd in diffs:
         sub = Selection()
         _select_file(fd, old.get(fd.old_path) if fd.old_path else None,
                      new.get(fd.new_path) if fd.new_path else None, m, sub)
+        if sub.everything and _bounded_by_imports(fd, m):
+            hit = m.import_breakers(fd.path)
+            if hit is not None:
+                sub.everything = False
+                sub.tests |= hit
+                sub.notes.append(f"bounded by importers of {fd.path}: {len(hit)} tests")
         sel.tests |= sub.tests
         sel.notes += sub.notes
+        for k, v in sub.import_probe.items():
+            sel.import_probe.setdefault(k, set()).update(v)
         if sub.everything:
             sel.everything = True
             break
     return sel
+
+
+def _bounded_by_imports(fd: FileDiff, m: Map) -> bool:
+    """A changed library module whose only way to matter is being imported:
+    an existing .py file under sqlglot/ (not a package __init__, which its
+    submodules import implicitly, nor a new or renamed file)."""
+    return (fd.old_path is not None and fd.old_path == fd.new_path and fd.path.endswith(".py")
+            and fd.path.startswith("sqlglot/") and not fd.path.endswith("__init__.py")
+            and fd.path in m.sources and not fd.binary)
 
 
 def _parent_lists(path: str, m: Map) -> set[int]:
@@ -244,8 +359,13 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
 
     if new_src is None or (fd.new_path and fd.new_path != fd.old_path):
         # deleted or moved module: every importer breaks, directly or not
-        sel.everything = True
-        sel.notes.append(f"module removed/moved {path}")
+        hit = None if path.endswith("__init__.py") or not path.startswith("sqlglot/") else m.import_breakers(path)
+        if hit is None:
+            sel.everything = True
+            sel.notes.append(f"module removed/moved {path}")
+        else:
+            sel.tests |= hit | m.file_users(path)
+            sel.notes.append(f"module removed/moved {path}: {len(hit)} tests import it")
         return
 
     try:
@@ -265,13 +385,18 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
         sel.notes.append(f"syntax error {path}")
         return
     if _maybe_cosmetic(fd) and _strip_docless(old_src) == new_dump:
-        # only comments / formatting changed: runtime code is identical, but
-        # line numbers move, so still run what executes the touched functions
-        scopes = Scopes(tree)
-        for line in fd.changed_old_lines():
-            span = scopes.func(line)
-            if span:
-                sel.tests |= m.line_tests(path, range(span[0], span[1] + 1))
+        # only comments / formatting changed: the bytecode is identical and
+        # only line numbers move. Tests see line numbers only through code
+        # objects or the source text, and the tests that read this file are
+        # already selected above. An encoding cookie on line 1-2 changes how
+        # the whole file decodes, so that counts as code.
+        cookie = re.compile(r"^[ \t\f]*#.*?coding[:=]")
+        heads = (old_src.split("\n")[:2], new_src.split("\n")[:2])
+        if any(cookie.match(l) for h in heads for l in h) and heads[0] != heads[1]:
+            sel.tests |= m.file_users(path)
+            sel.notes.append(f"encoding line changed {path}")
+            return
+        sel.tests |= m.code_readers & m.file_users(path)
         sel.notes.append(f"comment/format only {path}")
         return
 
@@ -308,6 +433,18 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
                 if f != path and pat.search(text):
                     sel.tests |= m.file_users(f)
         sel.notes.append(f"resolver over budget for {path}: broad fallback")
+        g = m.import_graph()
+        if path in g.eager or path in m.old_import_graph().eager or g.bad:
+            # loaded by `import sqlglot`: the change may break or alter that
+            # import, which every test goes through
+            sel.everything = True
+            sel.notes.append(f"{path} is imported by sqlglot itself: every test")
+            return
+        if _bounded_by_imports(fd, m):
+            hit = m.import_breakers(path)
+            if hit is not None and len(hit) < len(sel.tests):
+                sel.tests = hit | set(m.opens.get(path, ()))
+                sel.notes.append(f"importers of {path} instead: {len(hit)} tests")
     if edit is not None:
         _narrow_compare(fd, edit, m, sel)
     elif path.startswith("sqlglot/"):
@@ -438,6 +575,7 @@ class Ctx:
         self.lines = src.split("\n")
         self._names: dict[str, list[int]] | None = None
         self.imports_from: dict[str, str] = {}  # local alias -> imported name
+        self.import_lines: dict[str, list[int]] = {}  # local alias -> lines of its `from` imports
         self.star = False
         for node in ast.walk(self.tree):
             if isinstance(node, ast.ImportFrom):
@@ -446,6 +584,7 @@ class Ctx:
                         self.star = True
                     else:
                         self.imports_from[a.asname or a.name] = a.name
+                        self.import_lines.setdefault(a.asname or a.name, []).append(node.lineno)
 
     def name_refs(self, name: str) -> list[int]:
         """Lines that read the bare name."""
@@ -499,6 +638,26 @@ class Resolver:
 
         self._deadline = time.process_time() + MAX_SECONDS
 
+    def import_break(self, f: str, why: str, fctx=None, aliases=()) -> bool:
+        """Importing f now raises. Select whatever that breaks; False (and
+        every test) when that can't be bounded."""
+        if fctx is not None:
+            lines = [l for al in aliases for l in fctx.import_lines.get(al, ())]
+            if lines and all(fctx.scopes.func(l) is not None for l in lines):
+                # only imported inside functions: fails when those lines run
+                hit = self.m.line_tests(f, lines) if f.startswith("sqlglot/") else set(self.m.by_file.get(f, ()))
+                self.sel.tests |= hit
+                self.sel.notes.append(f"{why} (in functions): {len(hit)} tests")
+                return True
+        hit = self.m.import_breakers(f)
+        if hit is None:
+            self.sel.everything = True
+            self.sel.notes.append(why)
+            return False
+        self.sel.tests |= hit
+        self.sel.notes.append(f"{why}: {len(hit)} tests import it")
+        return True
+
     def _tick(self) -> None:
         import time
 
@@ -547,11 +706,13 @@ class Resolver:
         self._tick()
         m, sel = self.m, self.sel
         span = ctx.scopes.func(line)
-        if span is not None and span[2] != line and line in m.imports.get(path, ()):
+        if span is not None and span[2] != line and line in m.imports.get(path, ()) and path not in m.import_ok:
             # this function ran while modules were being imported: what it
             # computed (or raised) there is shared by every test, and the map
-            # credits import-time work to no test
+            # credits import-time work to no test. The caller may check that
+            # importing the patched tree leaves the same state (import_ok).
             sel.everything = True
+            sel.import_probe.setdefault(path, set()).add(line)
             sel.notes.append(f"function line run at import time {path}:{line}")
             return
         if span is not None and span[2] != line:
@@ -683,8 +844,8 @@ class Resolver:
             self._done.add(("modname", path, name))
             if name in self.removed_names and any(ctx.scopes.func(l) is None for l in ctx.name_refs(name)):
                 # still referenced while the module runs: importing it now fails
-                self.sel.everything = True
-                self.sel.notes.append(f"{path} uses removed name {name} at import")
+                if self.import_break(path, f"{path} uses removed name {name} at import"):
+                    continue
                 raise OverBudget()
             # inside the file: every statement that reads the name
             for l in ctx.name_refs(name):
@@ -704,8 +865,8 @@ class Resolver:
                 aliases = {al for al, orig in fctx.imports_from.items() if orig == name}
                 if name in self.removed_names and aliases:
                     # `from x import name` of a name that is gone fails at import
-                    self.sel.everything = True
-                    self.sel.notes.append(f"{f} imports removed name {name}")
+                    if self.import_break(f, f"{f} imports removed name {name}", fctx, aliases):
+                        continue
                     raise OverBudget()
                 if fctx.star:
                     aliases.add(name)

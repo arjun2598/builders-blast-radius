@@ -31,6 +31,7 @@ CPU_TABLE = Path(os.environ.get("BLAST_CPU", "/app/data/cpu.json"))
 DUCK = Path(os.environ.get("BLAST_DUCK", "/app/data/duck.pkl.gz"))
 CMP = Path(os.environ.get("BLAST_CMPMAP", "/app/data/cmp"))
 KEYS = Path(os.environ.get("BLAST_KEYMAP", "/app/data/keys"))
+NEEDS = Path(os.environ.get("BLAST_NEEDS", "/app/data/imports.json.gz"))
 SUB_BASE = 10_000_000  # map numbers of single pool tasks, see build_map.py
 SLOW = float(os.environ.get("BLAST_SLOW", "5.0"))  # CPU s: report unrun at/above this
 CPU_SCALE = float(os.environ.get("BLAST_CPU_SCALE", "1.2"))  # scorer box vs where cpu.json was measured
@@ -134,6 +135,14 @@ def prepare(c: Commit, m: candidates.Map, all_tests: list[dict], cm: "CostModel"
             if fd.binary:
                 raise patch.ApplyError("binary patch")
         sel = candidates.select(diffs, old, new, m)
+        if sel.everything and sel.import_probe and all(p.startswith("sqlglot/") for p in sel.import_probe):
+            if import_state_same(c, sel.import_probe):
+                m.import_ok = set(sel.import_probe)
+                try:
+                    sel = candidates.select(diffs, old, new, m)
+                finally:
+                    m.import_ok = set()
+                log(c.id, "import-time runs leave the same state:", "everything" if sel.everything else len(sel.tests))
         cands = set(secs) if sel.everything else set(sel.tests)
         if sel.notes:
             log(c.id, "notes:", "; ".join(sel.notes))
@@ -165,6 +174,61 @@ def prepare(c: Commit, m: candidates.Map, all_tests: list[dict], cm: "CostModel"
             del c.subsets[t]
     if c.subsets:
         log(c.id, "tasks:", {t: len(v) for t, v in c.subsets.items()})
+
+
+_origin_state: dict = {}
+
+
+def _fingerprint(req: dict, seed: str):
+    import subprocess
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", dir=TMP, delete=False) as fh:
+        json.dump(req, fh)
+    env = dict(os.environ, PYTHONHASHSEED=seed, PYTHONPATH=str(Path(__file__).resolve().parent.parent))
+    if PYC and os.path.isdir(PYC):
+        env["PYTHONPYCACHEPREFIX"] = PYC
+    try:
+        r = subprocess.run([sys.executable, "-m", "blast.fingerprint", str(REPO.resolve()), fh.name], env=env, cwd=str(TMP),
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+        return json.loads(r.stdout) if r.returncode == 0 else None
+    except Exception as e:  # noqa: BLE001
+        log("fingerprint failed:", repr(e))
+        return None
+    finally:
+        os.unlink(fh.name)
+
+
+def import_state_same(c: "Commit", probe: dict) -> bool:
+    """Does importing the patched tree leave every module- and class-level
+    value as the pinned tree does, with the probed lines really run by that
+    import (not by some test module's)? Values that differ between two
+    imports of the pinned tree are noise no test can rely on."""
+    if "base" not in _origin_state:
+        a = _fingerprint({"files": {}, "watch_all": True}, "0")
+        b = _fingerprint({"files": {}}, "1")
+        _origin_state["base"] = None if a is None or b is None else (
+            a["fp"], {k for k in a["fp"] if b["fp"].get(k) != a["fp"][k]} | (set(b["fp"]) ^ set(a["fp"])),
+            {f: set(ls) for f, ls in a["ran"].items()}, set(a["errors"]))
+    base = _origin_state["base"]
+    if base is None:
+        return False
+    fp0, noise, ran0, err0 = base
+    if any(not set(ls) <= ran0.get(f, set()) for f, ls in probe.items()):
+        log(c.id, "probed lines not run by importing sqlglot")
+        return False
+    files = {f: t for f, t in c.new_files.items() if f.endswith(".py")}
+    if len(files) != len(c.new_files):
+        return False
+    r = _fingerprint({"files": files}, "0")
+    if r is None or set(r["errors"]) != err0:
+        log(c.id, "patched import failed or differs:", None if r is None else sorted(set(r["errors"]) ^ err0)[:5])
+        return False
+    keys = (set(fp0) | set(r["fp"])) - noise
+    diff = [k for k in keys if fp0.get(k) != r["fp"].get(k)]
+    if diff:
+        log(c.id, "import-time state differs:", diff[:5])
+    return not diff
 
 
 class CostModel:
@@ -258,6 +322,7 @@ def main() -> None:
         from . import cmpcheck
 
         m.keys = cmpcheck.KeyMap(str(KEYS))
+    m.load_needs(str(NEEDS))
     for f in list(REPO.glob("sqlglot/**/*.py")) + list(REPO.glob("tests/**/*.py")):
         m.sources[str(f.relative_to(REPO))] = f.read_text()
 
@@ -348,7 +413,9 @@ def main() -> None:
                                [ids[t] for t in c.run], timeouts, str(TMP / f"res_{c.id}.json"),
                                subsets={ids[t]: v for t, v in c.subsets.items()},
                                duck=str(DUCK) if c.duck and DUCK.exists() else None,
-                               lazy={ids[t] for t in m.subtasks if t in ids})
+                               lazy={ids[t] for t in m.subtasks if t in ids},
+                               costs={ids[t]: (cm.test_cpu(t), ms[t]) for t in c.run},
+                               listed=[ms[t] for t in c.report])
                 except BaseException as e:  # noqa: BLE001
                     log(c.id, "child error", repr(e))
                     code = 1

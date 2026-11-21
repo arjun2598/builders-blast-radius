@@ -29,9 +29,17 @@ ones against the patched code, and report only those that fail.
    - a module-level name edit (constant, import, function header) → every
      statement that reads the name, in its own file and in files that import
      it or access it as an attribute or string;
-   - a removed name still used at import time → every test (imports break);
-   - a function line that ran while modules were imported → every test;
-   - comment/format-only edits (identical AST) → only the touched functions;
+   - a removed name still used at import time → the tests that import that
+     module (see below);
+   - a function line that ran while modules were imported → every test,
+     unless importing the patched tree leaves every module- and class-level
+     value as it was (`src/blast/fingerprint.py`: one subprocess imports all
+     of sqlglot with the patched texts swapped in and digests that state,
+     code objects excluded; values that differ between two imports of the
+     pinned tree are ignored as noise). Then the line counts like any other;
+   - comment/format-only edits (identical AST) → nothing, beyond tests that
+     read the file or look at code objects (bytecode is unchanged, only line
+     numbers move); an encoding-line change counts as code;
    - a patch that changes only one comparison (operator or literal operand)
      → only tests whose recorded operands (`data/cmp`, per test and site)
      could compare differently; a test that never evaluated it is unaffected.
@@ -48,6 +56,19 @@ ones against the patched code, and report only those that fail.
 
    Resolution has a work budget. Past it, the change falls back to users of
    the file plus users of every file that mentions a touched name.
+
+   **Importer bound.** A changed module that `import sqlglot` does not load
+   can only matter to tests that import it. So any "every test" outcome for
+   such a file, and any over-budget fallback that is larger, becomes: the
+   modules that import it, directly or through others (a static import graph
+   of the pinned and the patched tree, module level only), and the tests that
+   need one of them. A test needs a module if its test file imports it at the
+   top, if it ran its code or created its classes, if it lists its directory,
+   or if the module-needs map (`data/imports.json.gz`) says so. That map comes
+   from a separate pass (`tools/mapper_imports.py`): sqlglot is imported bare,
+   a child per test file imports that file, and a grandchild per test records
+   every sqlglot module the test loads or asks for (lazy dialect lookups,
+   imports inside functions).
 3. **Run or list** (`src/blast/main.py`). From measured CPU costs
    (`data/cpu.json`), each commit either lists its candidates without running
    them or runs them. Very slow tests are always listed without running.
@@ -65,9 +86,12 @@ ones against the patched code, and report only those that fail.
    - a slow test whose process-pool tasks were mapped one by one (the TPC-DS
      and TPC-H executor tests) runs only the tasks the change can reach; the
      others yield None, which the test already treats as "not executed";
-   - it stops at the first failure (a failed subtest ends its test, and the
-     split tests' pool tasks run only when their results are read); the
-     tests it didn't run are listed.
+   - after a failure the rest of that test file is listed without running
+     (failures cluster by file). Other files keep running while their
+     estimated CPU is below the simulated time listing them would add, given
+     the share of files that failed so far; otherwise everything not run is
+     listed. A failed subtest ends its test, and the split tests' pool tasks
+     run only when their results are read.
 5. **Pack**: what gets reported is split across workers to minimise the
    busiest worker's time plus 2 s per worker.
 
@@ -129,6 +153,14 @@ MAP_KEYS=1 ../venv/bin/python ../../tools/mapper_fork.py ../../blast-radius-samp
 MAP_KEYS=1 ../venv/bin/python ../../tools/mapper_fork.py ../../blast-radius-sample/sample/tests.json ../rawkeyssplit 7 1
 cd ../.. && python3 tools/build_cmp.py work/rawcmp work/rawcmpsplit blast-radius-sample/sample/tests.json data/map.json.gz data/cmp
 python3 tools/build_keys.py work/rawkeys work/rawkeyssplit blast-radius-sample/sample/tests.json data/map.json.gz data/keys
+```
+
+The module-needs map (about 75 s):
+
+```sh
+cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=../../tools:../../src \
+  ../venv/bin/python ../../tools/mapper_imports.py ../../blast-radius-sample/sample/tests.json ../rawimports 7
+cd ../.. && python3 tools/build_imports.py work/rawimports work/sqlglot data/imports.json.gz
 ```
 
 Each test is mapped in its own forked process (about 3 min), so caches filled
