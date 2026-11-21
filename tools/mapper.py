@@ -238,9 +238,259 @@ if os.environ.get("MAP_ATTRS", "1") == "1":
     _install_import_hook()
 
 
+# ---- comparison operands ---------------------------------------------------
+# With MAP_CMP=1 every single comparison `a OP b` in sqlglot is compiled as
+# __blast_cmp__(site, OP, a, b), which records per test what the operands
+# were (literal values; otherwise type and whether its == is identity) and
+# returns a OP b. An edit to one comparison can then be checked against what
+# each test actually compared (see candidates.cmp_filter).
+
+import ast as _ast  # noqa: E402
+import builtins as _builtins  # noqa: E402
+import operator as _op  # noqa: E402
+
+CMP_CAP = 64  # distinct observations per test and site; beyond that "many"
+_cmp: dict = {}  # key -> {site: set of observations, or None = too many}
+_OPS = {"Eq": _op.eq, "NotEq": _op.ne, "Lt": _op.lt, "LtE": _op.le, "Gt": _op.gt, "GtE": _op.ge,
+        "Is": _op.is_, "IsNot": _op.is_not, "In": lambda a, b: a in b, "NotIn": lambda a, b: a not in b}
+_SCALARS = (type(None), bool, int, float, str, bytes)
+_okcache: dict = {}
+
+
+def _okey(x):
+    t = type(x)
+    if t in _SCALARS and (t not in (str, bytes) or len(x) <= 120):
+        return ("v", repr(x))
+    if t is tuple and len(x) <= 16 and all(type(e) in _SCALARS for e in x) and len(repr(x)) <= 400:
+        return ("v", repr(x))
+    k = _okcache.get(t)
+    if k is None:
+        import enum
+
+        ideq = getattr(t, "__eq__", None) is object.__eq__ and getattr(t, "__ne__", None) is object.__ne__
+        # enum members of one class: distinct members have distinct values,
+        # so == between them is identity even for str/int mixins
+        is_enum = isinstance(t, type) and issubclass(t, enum.Enum) and t.__eq__ in (object.__eq__, enum.Enum.__eq__, str.__eq__, int.__eq__)
+        k = _okcache[t] = ("t", f"{t.__module__}.{t.__qualname__}", ideq, is_enum)
+    return k
+
+
+def _bc(site, op, a, b):
+    res = _OPS[op](a, b)
+    per = _cmp.get(_key)
+    if per is None:
+        per = _cmp[_key] = {}
+    obs = per.get(site, 0)
+    if obs is not None:
+        if obs == 0:
+            obs = per[site] = set()
+        try:
+            obs.add((_okey(a), _okey(b), a is b, res if type(res) is bool else None))
+        except Exception:  # noqa: BLE001
+            per[site] = None
+        else:
+            if len(obs) > CMP_CAP:
+                per[site] = None
+    return res
+
+
+class _CmpRewrite(_ast.NodeTransformer):
+    def __init__(self, rel):
+        self.rel = rel
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) != 1:
+            return node
+        site = f"{self.rel}:{node.lineno}:{node.col_offset}"
+        call = _ast.Call(func=_ast.Name("__blast_cmp__", _ast.Load()),
+                         args=[_ast.Constant(site), _ast.Constant(type(node.ops[0]).__name__),
+                               node.left, node.comparators[0]], keywords=[])
+        return _ast.copy_location(call, node)
+
+
+def _install_cmp():
+    import tempfile
+    from importlib.machinery import SourceFileLoader
+
+    _builtins.__blast_cmp__ = _bc
+    sys.pycache_prefix = tempfile.mkdtemp(prefix="cmp_pyc")  # never reuse plain bytecode
+    orig = SourceFileLoader.source_to_code
+
+    def source_to_code(self, data, path, *a, **k):
+        rel = _rel(path) if isinstance(path, str) else None
+        if not rel or not rel.startswith("sqlglot/"):
+            return orig(self, data, path, *a, **k)
+        tree = _CmpRewrite(rel).visit(_ast.parse(data, path))
+        _ast.fix_missing_locations(tree)
+        return compile(tree, path, "exec", dont_inherit=True)
+
+    SourceFileLoader.source_to_code = source_to_code
+
+
+if os.environ.get("MAP_CMP") == "1":
+    _install_cmp()
+
+
+# ---- dictionary keys -------------------------------------------------------
+# With MAP_KEYS=1 every class-level dict with literal keys is swapped (after
+# its module runs) for a dict subclass that records, per test, which keys'
+# values were read; reads that see every value (values(), items(), ==, copies
+# through those) count as "*". Key-only reads (iteration, `in`, len) don't
+# depend on values and aren't recorded.
+
+KEY_CAP = 4000
+_keys: dict = {}  # key -> {dict id: set of key reprs, or None = too many}
+
+
+def _krepr(k):
+    t = type(k)
+    if t in _SCALARS or (t is tuple and all(type(e) in _SCALARS for e in k)):
+        return repr(k)
+    return None
+
+
+def _kread(d, k):
+    per = _keys.get(_key)
+    if per is None:
+        per = _keys[_key] = {}
+    s = per.get(d._bk, 0)
+    if s is None:
+        return
+    if s == 0:
+        s = per[d._bk] = set()
+    r = "*" if k is _ALL else _krepr(k)
+    s.add(r if r is not None else "*")
+    if len(s) > KEY_CAP:
+        per[d._bk] = None
+
+
+class _KeyDict(dict):
+    __slots__ = ("_bk",)
+
+    def __getitem__(self, k):
+        _kread(self, k)
+        return dict.__getitem__(self, k)
+
+    def get(self, k, default=None):
+        _kread(self, k)
+        return dict.get(self, k, default)
+
+    def pop(self, k, *a):
+        _kread(self, k)
+        return dict.pop(self, k, *a)
+
+    def setdefault(self, k, default=None):
+        _kread(self, k)
+        return dict.setdefault(self, k, default)
+
+    def __iter__(self):  # makes dict(d) / {**d} go through keys() + __getitem__
+        return dict.__iter__(self)
+
+    def _all(self):
+        _kread(self, _ALL)
+
+    def values(self):
+        self._all()
+        return dict.values(self)
+
+    def items(self):
+        self._all()
+        return dict.items(self)
+
+    def copy(self):
+        self._all()
+        return dict(dict.items(self))
+
+    def popitem(self):
+        self._all()
+        return dict.popitem(self)
+
+    def __eq__(self, other):
+        self._all()
+        return dict.__eq__(self, other)
+
+    def __ne__(self, other):
+        self._all()
+        return dict.__ne__(self, other)
+
+    __hash__ = None
+
+    def __or__(self, other):
+        self._all()
+        return dict.__or__(self, other)
+
+    def __ror__(self, other):
+        self._all()
+        return dict.__ror__(self, other)
+
+    def __repr__(self):
+        self._all()
+        return dict.__repr__(self)
+
+    def __reduce_ex__(self, proto):
+        self._all()
+        return (dict, (dict(dict.items(self)),))
+
+
+class _AllKeys:
+    pass
+
+
+_ALL = _AllKeys()
+
+
+def _wrap_keys(module):
+    import enum
+    import inspect
+
+    for obj in list(vars(module).values()):
+        stack = [obj]
+        while stack:
+            cls = stack.pop()
+            if not inspect.isclass(cls) or cls.__module__ != module.__name__ or "_blast_keys" in cls.__dict__:
+                continue
+            stack.extend(v for v in vars(cls).values() if inspect.isclass(v))
+            if issubclass(cls, enum.Enum):
+                continue
+            for name, value in list(vars(cls).items()):
+                if type(value) is not dict or name.startswith("__") or not value or len(value) > 20000:
+                    continue
+                if any(_krepr(k) is None for k in value):
+                    continue
+                d = _KeyDict(value)
+                d._bk = f"{_rel(module.__file__) if getattr(module, '__file__', None) else module.__name__}" \
+                        f"::{cls.__qualname__}::{name}"
+                try:
+                    setattr(cls, name, d)
+                except (TypeError, AttributeError):
+                    pass
+            try:
+                cls._blast_keys = True
+            except (TypeError, AttributeError):
+                pass
+
+
+def _install_keys():
+    from importlib.machinery import SourceFileLoader
+
+    orig = SourceFileLoader.exec_module
+
+    def exec_module(self, module):
+        orig(self, module)
+        if module.__name__.split(".")[0] == "sqlglot":
+            _wrap_keys(module)
+
+    SourceFileLoader.exec_module = exec_module
+
+
+if os.environ.get("MAP_KEYS") == "1":
+    _install_keys()
+
 mon.use_tool_id(TOOL, "mapper")
 mon.register_callback(TOOL, mon.events.LINE, _on_line)
-mon.set_events(TOOL, mon.events.LINE)
+if os.environ.get("MAP_LINES", "1") == "1":
+    mon.set_events(TOOL, mon.events.LINE)
 sys.addaudithook(_audit)
 
 
@@ -364,6 +614,10 @@ def sections_dump(with_names=False):
         "types": lambda: {k: _class_keys(v) for k, v in _types.items()},
         **({"attr_names": lambda: [[_mod_file(m), q, a] for m, q, a in _attr_names]} if with_names else {}),
         "reads": lambda: {k: sorted({(i, _cls_key(c)) for i, c in v}) for k, v in _reads.items()},
+        "cmp": lambda: {k: {s: (list(o) if o is not None else None) for s, o in v.items()}
+                        for k, v in _cmp.items()},
+        "keys": lambda: {k: {d: (sorted(o) if o is not None else None) for d, o in v.items()}
+                         for k, v in _keys.items()},
     }
     data = {}
     for name, fn in sections.items():

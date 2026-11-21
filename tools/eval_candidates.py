@@ -5,6 +5,7 @@ python tools/eval_candidates.py <sqlglot checkout> <sample dir> <map>
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +19,16 @@ def main(repo, sample, map_path):
     secs = {t["number"]: t["seconds"] for t in tests}
     answers = json.load(open(sample / "answers.json"))["commits"]
     m = candidates.Map(map_path, tests)
+    cmp_dir = os.environ.get("BLAST_CMPMAP", str(Path(map_path).parent / "cmp"))
+    if os.path.isdir(cmp_dir):
+        from blast import cmpcheck
+
+        m.cmp = cmpcheck.CmpMap(cmp_dir)
+    key_dir = os.environ.get("BLAST_KEYMAP", str(Path(map_path).parent / "keys"))
+    if os.path.isdir(key_dir):
+        from blast import cmpcheck
+
+        m.keys = cmpcheck.KeyMap(key_dir)
     for f in list(repo.glob("sqlglot/**/*.py")) + list(repo.glob("tests/**/*.py")):
         m.sources[str(f.relative_to(repo))] = f.read_text()
     total = 0.0

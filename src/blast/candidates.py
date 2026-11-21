@@ -14,6 +14,7 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from . import cmpcheck
 from .patch import FileDiff
 
 
@@ -37,6 +38,8 @@ class Map:
         self.classes = m.get("classes", {})
         self.hooks = m.get("hooks", {})
         self.subtasks = {int(k): v for k, v in m.get("subtasks", {}).items()}
+        self.cmp: cmpcheck.CmpMap | None = None  # comparison operands, set by the caller
+        self.keys: cmpcheck.KeyMap | None = None  # dict keys read, set by the caller
         attrs = m.get("attrs", {"sets": [], "attr": {}, "import": {}})
         self.attr_sets, self.attr_index, self.attr_import = attrs["sets"], attrs["attr"], attrs["import"]
         self.tests = tests
@@ -45,6 +48,9 @@ class Map:
         self.by_file: dict[str, list[int]] = {}
         for t in tests:
             self.by_file.setdefault(t["file"], []).append(t["number"])
+
+    def all_subtasks(self) -> set[int]:
+        return {10_000_000 + n * 1000 + i for n, k in self.subtasks.items() for i in range(k)}
 
     def file_users(self, f: str) -> set[int]:
         """Tests that ran a line of f or instantiated a class defined in it."""
@@ -169,9 +175,13 @@ def select(diffs: list[FileDiff], old: dict, new: dict, m: Map) -> Selection:
     """old/new map path -> text (None if missing)."""
     sel = Selection()
     for fd in diffs:
+        sub = Selection()
         _select_file(fd, old.get(fd.old_path) if fd.old_path else None,
-                     new.get(fd.new_path) if fd.new_path else None, m, sel)
-        if sel.everything:
+                     new.get(fd.new_path) if fd.new_path else None, m, sub)
+        sel.tests |= sub.tests
+        sel.notes += sub.notes
+        if sub.everything:
+            sel.everything = True
             break
     return sel
 
@@ -270,7 +280,18 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
     except SyntaxError:  # handled above, kept for safety
         sel.everything = True
         return
+    edit = None
+    if m.cmp is not None and path.startswith("sqlglot/"):
+        try:
+            edit = cmpcheck.find_edit(old_src, new_src, tree, new_tree)
+        except Exception:  # noqa: BLE001
+            edit = None
     res = Resolver(m, sel)
+    if m.keys is not None and path.startswith("sqlglot/"):
+        try:
+            res.dict_edit = cmpcheck.find_dict_entry_edit(old_src, new_src, tree, new_tree)
+        except Exception:  # noqa: BLE001
+            res.dict_edit = None
     ctx = res.ctx(path, old_src)
     try:
         _resolve_change(fd, tree, new_tree, ctx, res, m, sel)
@@ -287,8 +308,38 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
                 if f != path and pat.search(text):
                     sel.tests |= m.file_users(f)
         sel.notes.append(f"resolver over budget for {path}: broad fallback")
+    if edit is not None:
+        _narrow_compare(fd, edit, m, sel)
+    elif path.startswith("sqlglot/"):
+        try:
+            span = cmpcheck.find_handler_edit(old_src, new_src, tree, new_tree)
+        except Exception:  # noqa: BLE001
+            span = None
+        if span is not None and not any(l in m.imports.get(path, ()) for l in range(span[0], span[1] + 1)):
+            before = len(sel.tests) if not sel.everything else len(m.tests)
+            sel.everything = False
+            sel.tests = m.line_tests(path, range(span[0], span[1] + 1)) | set(m.opens.get(path, ()))
+            sel.notes.append(f"handler types {path}:{span[0]}: {before} -> {len(sel.tests)}")
     sel.tests |= m.popen
 
+
+def _narrow_compare(fd: FileDiff, edit, m: Map, sel: Selection) -> None:
+    """The file's only change is one comparison: keep the tests whose
+    recorded evaluations could come out differently, plus tests the operand
+    pass didn't map and tests that read the source file."""
+    r = cmpcheck.narrow(edit, fd.path, m.cmp)
+    if r is None:
+        sel.notes.append(f"comparison edit {fd.path}:{edit.site[0]} not judged")
+        return
+    hit, safe = r
+    if sel.everything:
+        base = {t["number"] for t in m.tests} | m.all_subtasks()
+        sel.everything = False
+    else:
+        base = set(sel.tests)
+    sel.tests = (base - safe) | set(m.opens.get(fd.path, ()))
+    sel.notes.append(f"comparison edit {fd.path}:{edit.site[0]} {edit.op_old}->{edit.op_new}: "
+                     f"{len(base)} -> {len(sel.tests)}")
 
 def _direct_names(fd: FileDiff, ctx: "Ctx") -> set[str]:
     """Names bound by the module- and class-level statements the diff touches."""
@@ -437,6 +488,7 @@ class Resolver:
     def __init__(self, m: Map, sel: Selection):
         self.m = m
         self.sel = sel
+        self.dict_edit: tuple[str, str, str] | None = None  # (class, attr, key) of a dict-entry edit
         self._ctx: dict[str, Ctx] = {}
         self.removed_names: set[str] = set()
         self.added_names: set[str] = set()
@@ -567,7 +619,14 @@ class Resolver:
             key = f"{path}::{qual}::{a}"
             if key not in m.attr_index:
                 return self.class_fallback(path, qual, f"untracked attribute {a}")
-            sel.tests |= m.attr_readers(key)
+            readers = m.attr_readers(key)
+            de = self.dict_edit
+            if de is not None and de[0] == qual and de[1] == a:
+                narrowed = cmpcheck.key_readers(m.keys, path, qual, a, de[2], readers)
+                if narrowed is not None:
+                    sel.notes.append(f"dict entry {a}[{de[2][:30]}]: {len(readers)} -> {len(narrowed)} readers")
+                    readers = narrowed
+            sel.tests |= readers
             for k in m.attr_import.get(key, ()):
                 f, _, q = k.partition("::")
                 if f == "MOD":  # read while module q was being imported

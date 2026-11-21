@@ -126,15 +126,20 @@ def apply(old_text: str | None, fd: FileDiff) -> str | None:
     for h in fd.hunks:
         start = max(h.old_start - 1, 0) if h.old_start else 0
         expected = [l[1:].replace("\\NOEOL", "") for l in h.lines if l[:1] in (" ", "-")]
-        # tolerate small offsets like `patch` does
+        # The stated position wins; otherwise the old lines may sit anywhere
+        # after the previous hunk, but only where they match exactly once (a
+        # guess between several places could hide which code really changed).
         found = None
-        for delta in range(0, 200):
-            for cand in (start + delta, start - delta):
-                if cand >= pos and src[cand:cand + len(expected)] == expected:
-                    found = cand
-                    break
-            if found is not None:
-                break
+        if src[start:start + len(expected)] == expected and start >= pos:
+            found = start
+        elif expected:
+            first = expected[0]
+            hits = [i for i in range(pos, len(src) - len(expected) + 1)
+                    if src[i] == first and src[i:i + len(expected)] == expected]
+            if len(hits) == 1:
+                found = hits[0]
+            elif hits:
+                raise ApplyError(f"hunk at {h.old_start} matches {len(hits)} places in {fd.path}")
         if found is None:
             raise ApplyError(f"hunk at {h.old_start} does not apply to {fd.path}")
         out.extend(src[pos:found])

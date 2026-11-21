@@ -32,6 +32,16 @@ ones against the patched code, and report only those that fail.
    - a removed name still used at import time → every test (imports break);
    - a function line that ran while modules were imported → every test;
    - comment/format-only edits (identical AST) → only the touched functions;
+   - a patch that changes only one comparison (operator or literal operand)
+     → only tests whose recorded operands (`data/cmp`, per test and site)
+     could compare differently; a test that never evaluated it is unaffected.
+     `==` vs `is` is judged only for literals, identity-equality types and
+     members of one enum;
+   - a patch that changes only one value of a class-level dict literal →
+     tests that read that key's value (`data/keys`) instead of every reader
+     of the dict, unless the key was read at import time;
+   - a patch that changes only an `except` clause's types → tests that ran
+     that header line (it runs only while an exception is being matched);
    - a fixture → tests that opened it; a new data file → tests that list its
      directory;
    - deleted/moved modules, unparseable or unmapped code → every test.
@@ -55,7 +65,9 @@ ones against the patched code, and report only those that fail.
    - a slow test whose process-pool tasks were mapped one by one (the TPC-DS
      and TPC-H executor tests) runs only the tasks the change can reach; the
      others yield None, which the test already treats as "not executed";
-   - it stops at the first failure; the tests it didn't run are listed.
+   - it stops at the first failure (a failed subtest ends its test, and the
+     split tests' pool tasks run only when their results are read); the
+     tests it didn't run are listed.
 5. **Pack**: what gets reported is split across workers to minimise the
    busiest worker's time plus 2 s per worker.
 
@@ -103,6 +115,20 @@ cd ../.. && python3 tools/cpu_table.py work/cpu_raw.json blast-radius-sample/sam
 cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=.:../../src ../venv/bin/python ../../tools/split_probe.py \
   ../../blast-radius-sample/sample/tests.json ../../data/map.json.gz ../../data/duck.pkl.gz ../../data/cpu.json \
   tests.test_executor tests.test_optimizer
+```
+
+Comparison operands and dict key reads come from two more forked passes
+(sqlglot compiled with comparisons rewritten to record their operands; class
+dicts swapped for a key-recording subclass):
+
+```sh
+cd work/sqlglot && export SKIP_INTEGRATION=0 PYTHONPATH=../../tools:../../src MAP_LINES=0 MAP_ATTRS=0
+MAP_CMP=1 ../venv/bin/python ../../tools/mapper_fork.py ../../blast-radius-sample/sample/tests.json ../rawcmp 7
+MAP_CMP=1 ../venv/bin/python ../../tools/mapper_fork.py ../../blast-radius-sample/sample/tests.json ../rawcmpsplit 7 1
+MAP_KEYS=1 ../venv/bin/python ../../tools/mapper_fork.py ../../blast-radius-sample/sample/tests.json ../rawkeys 7
+MAP_KEYS=1 ../venv/bin/python ../../tools/mapper_fork.py ../../blast-radius-sample/sample/tests.json ../rawkeyssplit 7 1
+cd ../.. && python3 tools/build_cmp.py work/rawcmp work/rawcmpsplit blast-radius-sample/sample/tests.json data/map.json.gz data/cmp
+python3 tools/build_keys.py work/rawkeys work/rawkeyssplit blast-radius-sample/sample/tests.json data/map.json.gz data/keys
 ```
 
 Each test is mapped in its own forked process (about 3 min), so caches filled

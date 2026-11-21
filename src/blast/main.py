@@ -29,6 +29,8 @@ TMP = Path(os.environ.get("BLAST_TMP", "/tmp"))
 SLOTS = int(os.environ.get("BLAST_SLOTS", "2"))
 CPU_TABLE = Path(os.environ.get("BLAST_CPU", "/app/data/cpu.json"))
 DUCK = Path(os.environ.get("BLAST_DUCK", "/app/data/duck.pkl.gz"))
+CMP = Path(os.environ.get("BLAST_CMPMAP", "/app/data/cmp"))
+KEYS = Path(os.environ.get("BLAST_KEYMAP", "/app/data/keys"))
 SUB_BASE = 10_000_000  # map numbers of single pool tasks, see build_map.py
 SLOW = float(os.environ.get("BLAST_SLOW", "5.0"))  # CPU s: report unrun at/above this
 CPU_SCALE = float(os.environ.get("BLAST_CPU_SCALE", "1.2"))  # scorer box vs where cpu.json was measured
@@ -248,6 +250,14 @@ def main() -> None:
     ids = {t["number"]: t["id"] for t in tests}
     by_id = {t["id"]: t["number"] for t in tests}
     m = candidates.Map(str(MAP), tests)
+    if CMP.is_dir():
+        from . import cmpcheck
+
+        m.cmp = cmpcheck.CmpMap(str(CMP))
+    if KEYS.is_dir():
+        from . import cmpcheck
+
+        m.keys = cmpcheck.KeyMap(str(KEYS))
     for f in list(REPO.glob("sqlglot/**/*.py")) + list(REPO.glob("tests/**/*.py")):
         m.sources[str(f.relative_to(REPO))] = f.read_text()
 
@@ -337,7 +347,8 @@ def main() -> None:
                     runner.run(str(slots[slot].path), str(REPO.resolve()), list(c.new_files),
                                [ids[t] for t in c.run], timeouts, str(TMP / f"res_{c.id}.json"),
                                subsets={ids[t]: v for t, v in c.subsets.items()},
-                               duck=str(DUCK) if c.duck and DUCK.exists() else None)
+                               duck=str(DUCK) if c.duck and DUCK.exists() else None,
+                               lazy={ids[t] for t in m.subtasks if t in ids})
                 except BaseException as e:  # noqa: BLE001
                     log(c.id, "child error", repr(e))
                     code = 1

@@ -24,7 +24,39 @@ import unittest
 
 # Pool tasks of the running test: index of the next one, and which to run
 # (None = all). A skipped task's future yields None; see Map.subtasks.
-_tasks: dict = {"n": 0, "only": None}
+# lazy: run a task when its result is first asked for, so a test that
+# checks results in order and fails early (with failfast) skips the rest.
+_tasks: dict = {"n": 0, "only": None, "lazy": False}
+
+
+def _call(blob):
+    fn, args, kwargs = pickle.loads(blob)
+    return pickle.loads(pickle.dumps(fn(*args, **kwargs)))
+
+
+def _lazy_future(blob):
+    from concurrent.futures import Future
+
+    class LazyFuture(Future):
+        _blob = blob
+
+        def _force(self):
+            if self._blob is not None:
+                b, self._blob = self._blob, None
+                try:
+                    self.set_result(_call(b))
+                except BaseException as e:  # noqa: BLE001
+                    self.set_exception(e)
+
+        def result(self, timeout=None):
+            self._force()
+            return super().result(timeout)
+
+        def exception(self, timeout=None):
+            self._force()
+            return super().exception(timeout)
+
+    return LazyFuture()
 
 
 class SyncExecutor:
@@ -46,8 +78,10 @@ class SyncExecutor:
             fut.set_result(None)
             return fut
         try:
-            fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
-            fut.set_result(pickle.loads(pickle.dumps(fn(*args, **kwargs))))
+            blob = pickle.dumps((fn, args, kwargs))
+            if _tasks["lazy"]:
+                return _lazy_future(blob)
+            fut.set_result(_call(blob))
         except BaseException as e:  # noqa: BLE001
             fut.set_exception(e)
         return fut
@@ -79,9 +113,14 @@ def _alarm(signum, frame):
 
 
 class Result(unittest.TestResult):
-    def __init__(self, ids: dict, timeouts: dict, stop_first: bool, subsets: dict | None = None):
+    def __init__(self, ids: dict, timeouts: dict, stop_first: bool, subsets: dict | None = None,
+                 lazy: set | None = None):
         super().__init__()
         self.subsets = subsets or {}
+        self.lazy = lazy or set()
+        # a failed subtest ends its test at once: the test already counts as
+        # failed, the rest of it would only cost CPU
+        self.failfast = stop_first
         self.ids = ids  # id(TestCase) -> nodeid
         self.timeouts = timeouts
         self.stop_first = stop_first
@@ -102,11 +141,12 @@ class Result(unittest.TestResult):
         super().startTest(test)
         sub = self.subsets.get(self.ids.get(id(test)))
         _tasks["n"], _tasks["only"] = 0, (set(sub) if sub is not None else None)
+        _tasks["lazy"] = self.ids.get(id(test)) in self.lazy
         signal.setitimer(signal.ITIMER_REAL, self.timeouts.get(self.ids.get(id(test)), 30.0))
 
     def stopTest(self, test):
         signal.setitimer(signal.ITIMER_REAL, 0)
-        _tasks["n"], _tasks["only"] = 0, None
+        _tasks["n"], _tasks["only"], _tasks["lazy"] = 0, None, False
         nid = self.ids.get(id(test))
         if nid:
             self.done.add(nid)
@@ -140,7 +180,8 @@ def _repoint(workdir: str, origin: str) -> None:
 
 def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
         timeouts: dict[str, float], out_path: str, stop_first: bool = True,
-        subsets: dict[str, list[int]] | None = None, duck: str | None = None) -> None:
+        subsets: dict[str, list[int]] | None = None, duck: str | None = None,
+        lazy: set[str] | None = None) -> None:
     """subsets: nodeid -> the only pool tasks to run (the map says no other
     task can see the change). duck: recorded DuckDB answers to reuse."""
     os.chdir(workdir)
@@ -176,6 +217,8 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
 
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)  # keep the parent's stdout clean
+    if sys.pycache_prefix:
+        os.environ["PYTHONPYCACHEPREFIX"] = sys.pycache_prefix  # subprocesses use the bytecode too
     signal.signal(signal.SIGALRM, _alarm)
 
     # group by module and class, keeping the given (cheap-first) order
@@ -188,7 +231,7 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
         order.setdefault(parts[0], {}).setdefault(parts[1], []).append((nid, parts[2]))
 
     ids: dict[int, str] = {}
-    result = Result(ids, timeouts, stop_first, subsets)
+    result = Result(ids, timeouts, stop_first, subsets, lazy)
     failed: set[str] = set()
     for path, classes in order.items():
         if result.shouldStop:
