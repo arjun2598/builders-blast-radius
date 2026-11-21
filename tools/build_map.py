@@ -26,6 +26,8 @@ def main(raw_dir, tests_path, out_path):
     import_lines = defaultdict(set)
     opens, lists, popen = defaultdict(set), defaultdict(set), set()
     classes = defaultdict(set)
+    wrapped, attr_readers, attr_import = set(), defaultdict(set), defaultdict(set)
+    attr_setup, hooks = defaultdict(set), {}
     class_setup_types = defaultdict(set)
     class_setup = defaultdict(lambda: defaultdict(set))  # class -> file -> lines
     unknown = set()
@@ -34,8 +36,10 @@ def main(raw_dir, tests_path, out_path):
         nodeid, _, phase = key.partition("\0")
         return num.get(nodeid), nodeid, phase
 
+    seen_ids = set()
     for path in sorted(Path(raw_dir).glob("*.json")):
         raw = json.load(open(path))
+        seen_ids |= {k.partition("\0")[0] for k in raw["hits"] if k}
         for key, files in raw["hits"].items():
             if key == "":
                 for f, ls in files.items():
@@ -63,6 +67,24 @@ def main(raw_dir, tests_path, out_path):
                 classes[c].add(n)
             if phase == "s":
                 class_setup_types[nodeid.rsplit("::", 1)[0]].update(keys)
+        names = [f"{f}::{q}::{a}" for f, q, a in raw.get("attr_names", [])]
+        wrapped.update(names)
+        for key, reads in raw.get("reads", {}).items():
+            if key == "":
+                for i, lk in reads:
+                    attr_import[names[i]].add(lk)
+                continue
+            n, nodeid, phase = owner(key)
+            if n is None:
+                continue
+            for i, _ in reads:
+                attr_readers[names[i]].add(n)
+            if phase == "s":
+                cls_id = nodeid.rsplit("::", 1)[0]
+                for i, _ in reads:
+                    attr_setup[cls_id].add(names[i])
+        for k, spans in raw.get("hooks", {}).items():
+            hooks[k] = spans
         for key, ev in raw["events"].items():
             if key == "":
                 continue
@@ -86,12 +108,31 @@ def main(raw_dir, tests_path, out_path):
             for l in ls:
                 line_tests[f][l] |= members
             line_tests[f][0] |= members
+    for cls, keys in attr_setup.items():
+        for a in keys:
+            attr_readers[a] |= by_class.get(cls, set())
     for cls, keys in class_setup_types.items():
         for c in keys:
             classes[c] |= by_class.get(cls, set())
 
+    covered = {nodeid for nodeid in seen_ids}
+    lost = [t["id"] for t in tests if t["id"] not in covered]
+    if lost:
+        raise SystemExit(f"raw map is missing {len(lost)} tests, e.g. {lost[:3]}: a worker failed")
+
     out = {"lines": {}, "import": {}, "users": {}, "opens": {}, "lists": {}, "popen": sorted(popen),
-           "classes": {c: sorted(s) for c, s in classes.items()}}
+           "classes": {c: sorted(s) for c, s in classes.items()},
+           "hooks": hooks}
+    # attribute readers, deduplicated like line sets
+    asets, aindex, aref = [], {}, {}
+    for a in sorted(wrapped):
+        k = tuple(sorted(attr_readers.get(a, ())))
+        if k not in aindex:
+            aindex[k] = len(asets)
+            asets.append(list(k))
+        aref[a] = aindex[k]
+    out["attrs"] = {"sets": asets, "attr": aref,
+                    "import": {a: sorted(v) for a, v in attr_import.items()}}
     for f, per_line in line_tests.items():
         users = per_line.pop(0, set())
         sets, index, line_idx = [], {}, {}

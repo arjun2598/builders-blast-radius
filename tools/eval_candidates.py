@@ -22,6 +22,8 @@ def main(repo, sample, map_path):
         m.sources[str(f.relative_to(repo))] = f.read_text()
     total = 0.0
     for p in sorted((sample / "commits").glob("*.patch")):
+        if p.stem not in answers:
+            continue
         diffs = patch.parse(p.read_text())
         old, new = {}, {}
         for fd in diffs:
@@ -31,14 +33,17 @@ def main(repo, sample, map_path):
                 old[fd.old_path] = src
             if fd.new_path:
                 new[fd.new_path] = patch.apply(src, fd)
+        import time as _t
+        t0 = _t.process_time()
         sel = candidates.select(diffs, old, new, m)
+        dt = _t.process_time() - t0
         cand = set(secs) if sel.everything else sel.tests
         ans = answers[p.stem]
         missed = set(ans["failing"]) - cand
         cpu = sum(secs[t] for t in cand)
         total += cpu
         print(f"{p.stem} {ans['kind']:8} fail={len(ans['failing']):3} cand={len(cand):5} "
-              f"cpu={cpu:6.1f} {'MISS ' + str(sorted(missed)) if missed else 'ok'} {sel.notes}")
+              f"cpu={cpu:6.1f} sel={dt:5.2f}s {'MISS ' + str(sorted(missed)) if missed else 'ok'} {sel.notes}")
     print(f"total candidate seconds {total:.1f}")
 
 
