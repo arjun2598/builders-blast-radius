@@ -6,7 +6,7 @@ ones against the patched code, and report only those that fail.
 ## How it works
 
 1. **Map** (`data/map.json.gz`, built once at the pinned commit by
-   `tools/mapper.py` + `tools/build_map.py`). For each test it records:
+   `tools/mapper_fork.py` + `tools/build_map.py`, one forked process per test). For each test it records:
    - which source lines ran (`sys.monitoring`), with work sent to process
      pools traced in-process;
    - which sqlglot classes were instantiated (for class-level edits);
@@ -74,7 +74,12 @@ python3 tools/eval_candidates.py work/sqlglot work/synth data/map.json.gz
 Rebuild the map after changing the mapper:
 
 ```sh
-cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=../../tools MAP_OUT=../rawmap \
-  ../venv/bin/python -m pytest -q -p no:cacheprovider -p mapper -n 4 tests
-cd ../.. && python3 tools/build_map.py work/rawmap blast-radius-sample/sample/tests.json data/map.json.gz
+cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=../../tools:../../src \
+  ../venv/bin/python ../../tools/mapper_fork.py ../../blast-radius-sample/sample/tests.json ../rawfork 6
+cd ../.. && python3 tools/build_map.py work/rawfork blast-radius-sample/sample/tests.json data/map.json.gz
 ```
+
+Each test is mapped in its own forked process (about 3 min), so caches filled
+by one test (the generator's dispatch table, memoized lookups) can't hide
+from the map what another test depends on. The older in-process pytest
+plugin is still there (`-p mapper`) but under-reports for exactly this reason.

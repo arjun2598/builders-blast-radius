@@ -37,6 +37,9 @@ def main(raw_dir, tests_path, out_path):
         return num.get(nodeid), nodeid, phase
 
     seen_ids = set()
+    failed_map = set()
+    base_path = Path(raw_dir) / "base.json"
+    base_names = json.load(open(base_path)).get("attr_names", []) if base_path.exists() else []
     for path in sorted(Path(raw_dir).glob("*.json")):
         raw = json.load(open(path))
         seen_ids |= {k.partition("\0")[0] for k in raw["hits"] if k}
@@ -67,13 +70,15 @@ def main(raw_dir, tests_path, out_path):
                 classes[c].add(n)
             if phase == "s":
                 class_setup_types[nodeid.rsplit("::", 1)[0]].update(keys)
-        names = [f"{f}::{q}::{a}" for f, q, a in raw.get("attr_names", [])]
+        names = [f"{f}::{q}::{a}" for f, q, a in (raw.get("attr_names") or base_names)]
         wrapped.update(names)
         for key, reads in raw.get("reads", {}).items():
             if key == "":
                 for i, lk in reads:
                     attr_import[names[i]].add(lk)
                 continue
+            if raw.get("ok") is False:
+                failed_map.add(key.partition("\0")[0])
             n, nodeid, phase = owner(key)
             if n is None:
                 continue
@@ -115,6 +120,8 @@ def main(raw_dir, tests_path, out_path):
         for c in keys:
             classes[c] |= by_class.get(cls, set())
 
+    if failed_map:
+        print(f"warning: {len(failed_map)} tests failed while mapping, e.g. {sorted(failed_map)[:3]}", file=sys.stderr)
     covered = {nodeid for nodeid in seen_ids}
     lost = [t["id"] for t in tests if t["id"] not in covered]
     if lost:

@@ -562,6 +562,9 @@ class Resolver:
             sel.tests |= m.attr_readers(key)
             for k in m.attr_import.get(key, ()):
                 f, _, q = k.partition("::")
+                if f == "MOD":  # read while module q was being imported
+                    sel.tests |= m.file_users(q)
+                    continue
                 users = set(m.classes.get(k, ()))
                 kctx = self.ctx(f)
                 kn = kctx.class_node(q) if kctx else None
