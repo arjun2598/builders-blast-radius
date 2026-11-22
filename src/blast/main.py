@@ -255,7 +255,7 @@ def import_state_diff(c: "Commit", probe: dict, m: candidates.Map) -> set[str] |
     # names the patch itself binds or unbinds (a removed import, a renamed
     # function or method) are followed by the resolver's name rules; whatever
     # reads one while importing fails there or differs elsewhere
-    noise = noise | _renamed_keys(c, m)
+    noise = noise | _renamed_keys(c, m) | _edited_keys(c, m)
     mods = _differing(fp0, err0, r, noise)
     if not mods:
         return set()
@@ -326,6 +326,46 @@ def _renamed_keys(c: "Commit", m: candidates.Map) -> set[str]:
         mod = f[:-3].replace("/", ".").removesuffix(".__init__")
         out |= {f"{mod}:{n}" for n in a ^ b}
     return out
+
+
+def _edited_keys(c: "Commit", m: candidates.Map) -> set[str]:
+    """Module-level names whose single plain assignment the patch edits: the
+    resolver follows their readers by name (a module-level reader is probed
+    in turn), so their own new values are not news to the probe."""
+    out = set()
+    for f, new_src in c.new_files.items():
+        old_src = m.sources.get(f)
+        if not (f.startswith("sqlglot/") and f.endswith(".py")) or old_src is None or new_src is None:
+            continue
+        try:
+            a, b = _plain_assigns(ast.parse(old_src)), _plain_assigns(ast.parse(new_src))
+        except SyntaxError:
+            continue
+        mod = f[:-3].replace("/", ".").removesuffix(".__init__")
+        out |= {f"{mod}:{n}" for n in a.keys() & b.keys() if a[n] is not None and b[n] is not None and a[n] != b[n]}
+    return out
+
+
+def _plain_assigns(tree: ast.Module) -> dict:
+    """name -> dump of its one module-level `name = ...` / `name: T = ...`
+    (None when the name is bound more than once or otherwise as well)."""
+    seen: dict = {}
+    for st in tree.body:
+        if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+            n, d = st.targets[0].id, ast.dump(st.value)
+        elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None:
+            n, d = st.target.id, ast.dump(st.value)
+        else:
+            for x in ast.walk(st):
+                if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
+                    seen[x.id] = None
+                elif isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    seen[x.name] = None
+                elif isinstance(x, ast.alias):
+                    seen[(x.asname or x.name).split(".")[0]] = None
+            continue
+        seen[n] = None if n in seen else d
+    return seen
 
 
 def _differing(fp0: dict, err0: set, r: dict, noise: set) -> set[str]:

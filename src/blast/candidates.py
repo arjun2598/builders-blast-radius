@@ -14,7 +14,7 @@ import os
 import re
 from dataclasses import dataclass, field
 
-from . import cmpcheck
+from . import cmpcheck, refactor
 from .patch import FileDiff
 
 
@@ -60,6 +60,7 @@ class Map:
         self.classes = m.get("classes", {})
         self.hooks = m.get("hooks", {})
         self.subtasks = {int(k): v for k, v in m.get("subtasks", {}).items()}
+        self.patched: dict | None = None  # path -> patched text, of the commit being selected
         self.subtask_raise = set(m.get("subtask_raise", ()))  # skipped tasks raise SkippedTask (see runner)
         self.cmp: cmpcheck.CmpMap | None = None  # comparison operands, set by the caller
         self.keys: cmpcheck.KeyMap | None = None  # dict keys read, set by the caller
@@ -220,6 +221,17 @@ class Map:
             return
         self.needs_mapped = set(d.pop("__mapped__", ()))
         self.needs = d
+
+    @property
+    def package_walkers(self) -> set[int]:
+        """Tests in test files that walk packages or directories for modules
+        (pkgutil, os.walk, glob): directory listings through the import
+        system aren't recorded as listings."""
+        if not hasattr(self, "_walkers"):
+            pat = re.compile(r"walk_packages|iter_modules|os\.walk|\bglob\(|\.rglob\(|listdir|scandir")
+            self._walkers = {n for f, ns in self.by_file.items()
+                             if pat.search(self.sources.get(f, "")) for n in ns}
+        return self._walkers
 
     @property
     def code_readers(self) -> set[int]:
@@ -430,6 +442,7 @@ def _strip_docless(src: str) -> str | None:
 
 def select(diffs: list[FileDiff], old: dict, new: dict, m: Map) -> Selection:
     """old/new map path -> text (None if missing)."""
+    m.patched = new
     sel = Selection()
     m.new_sources = {fd.new_path or fd.old_path: (new.get(fd.new_path) if fd.new_path else None) for fd in diffs}
     if fd_old := [fd.old_path for fd in diffs if fd.old_path and fd.old_path != fd.new_path]:
@@ -507,9 +520,20 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
         # a new module: only reachable via imports in other changed files,
         # package walkers or subprocesses
         pkg_init = os.path.join(os.path.dirname(path), "__init__.py")
-        sel.tests.update(m.users.get(pkg_init, ()))
         sel.tests.update(_parent_lists(path, m))
         sel.tests.update(m.popen)
+        sel.tests.update(m.package_walkers)
+        stem = os.path.basename(path)[:-3]
+        named = re.compile(rf"\b{re.escape(stem)}\b")
+        others = [t for f, t in list(m.sources.items()) + list((m.patched or {}).items())
+                  if f != path and t is not None and f.endswith(".py")]
+        if stem != "__init__" and os.path.basename(os.path.dirname(path)) != stem \
+                and not any(named.search(t) for t in others):
+            # named by no code: only what walks the package (tests that list
+            # its directory) or runs Python in a subprocess can load it
+            sel.notes.append(f"new module {path} named nowhere")
+            return
+        sel.tests.update(m.users.get(pkg_init, ()))
         sel.notes.append(f"new module {path}")
         return
 
@@ -570,6 +594,47 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
     except SyntaxError:  # handled above, kept for safety
         sel.everything = True
         return
+    if path.endswith(".py"):
+        # a refactor proven from the two ASTs (renamed locals or private
+        # names, reordered defs or imports): as for a comment-only edit
+        sources = dict(m.sources)
+        for f, text in (m.patched or {}).items():
+            if f != path and text is not None:
+                sources[f + "\0new"] = text
+        lambdas = refactor.lambda_edits(tree, new_tree)
+        if lambdas:
+            # a line that also runs while importing (where the lambda is
+            # created) is credited to no test: the edit must be on lambda
+            # lines only calls run
+            touched = fd.changed_old_lines()
+            at_import = m.imports.get(path, set())
+            for lam in lambdas:
+                span = set(range(lam.lineno, (lam.end_lineno or lam.lineno) + 1))
+                inside = touched & span
+                if not inside or inside & at_import or lam.lineno in inside:
+                    lambdas = None
+                    break
+        if lambdas:
+            # only the bodies of lambdas defined at module or class level
+            # changed: they run when called, and every call runs their lines
+            for lam in lambdas:
+                sel.tests |= m.line_tests(path, range(lam.lineno + 1, (lam.end_lineno or lam.lineno) + 1))
+            sel.tests |= m.code_readers & m.file_users(path)
+            sel.notes.append(f"lambda bodies {path}: {[l.lineno for l in lambdas]}")
+            return
+        same = refactor.equivalent(tree, new_tree, path, sources)
+        if same == "probe" and path.startswith("sqlglot/") and path in m.import_graph().eager \
+                and path not in m.import_ok:
+            # sqlglot imports reordered in a module `import sqlglot` loads:
+            # same if the patched import leaves the same state
+            sel.everything = True
+            sel.import_probe.setdefault(path, set())
+            sel.notes.append(f"imports reordered {path}")
+            return
+        if same == "same" or (same == "probe" and path in m.import_ok):
+            sel.tests |= m.code_readers & m.file_users(path)
+            sel.notes.append(f"refactor only {path}")
+            return
     edit = None
     if m.cmp is not None and path.startswith("sqlglot/"):
         try:
@@ -718,8 +783,10 @@ def _resolve_change(fd, tree, new_tree, ctx, res, m, sel) -> None:
                 # after the anchor: it runs where they ran, and their removed
                 # lines are resolved already
                 run, r = [], (node.end_lineno or node.lineno) + 1
-                while r in removed:
-                    run.append(r)
+                while r in removed or (not run and 0 < r <= len(ctx.lines) and r < line + 50
+                                       and _blank_or_comment(ctx.lines[r - 1])):
+                    if r in removed:
+                        run.append(r)
                     r += 1
                 if run and all((x := ctx.st.innermost(q)) is not None and not hasattr(x, "body") for q in run):
                     continue
@@ -740,6 +807,11 @@ def _resolve_change(fd, tree, new_tree, ctx, res, m, sel) -> None:
                 res.line(path, ctx, old_line)
     for name in sorted(res.added_names):
         res.module_names(path, ctx, {name}, set(), 0)
+
+
+def _blank_or_comment(text: str) -> bool:
+    t = text.strip()
+    return not t or t.startswith("#")
 
 
 def _class_body_stmt(tree: ast.AST, line: int):
@@ -1086,7 +1158,31 @@ class Resolver:
                 self.sel.tests |= hit
                 self.sel.notes.append(f"method {c[2]}.{new_node.name} added: {len(hit)} tests")
                 return
+        if new_node is not None and refactor.inert_member(new_node) and self._inert_class(path, c[2]):
+            name = refactor.member_name(new_node)
+            new_text = (self.m.patched or {}).get(path)
+            sources = dict(self.m.sources)
+            for f, text in (self.m.patched or {}).items():
+                if f != path and text is not None:
+                    sources[f + "\0new"] = text
+            if name and new_text and refactor.invisible_name(name, path, new_text, sources):
+                # a new member nothing names: no code can read it
+                self.sel.tests |= self.m.code_readers & self.m.file_users(path)
+                self.sel.notes.append(f"new member {c[2]}.{name} named nowhere else")
+                return
         self.class_fallback(path, c[2], "statement added to class body")
+
+    def _inert_class(self, path: str, qual: str) -> bool:
+        """No creation hook of the class walks its namespace generically."""
+        generic = re.compile(r"__dict__|\bdir\(|\bvars\(|getmembers|inspect\.|\.items\(\)")
+        key = f"{path}::{qual}"
+        if key not in self.m.hooks and path not in self.m.import_graph().eager:
+            return False  # hooks are recorded for classes the mapper had loaded only
+        for f, s0, e0 in self.m.hooks.get(key, []):
+            hctx = self.ctx(f)
+            if hctx is None or generic.search("\n".join(hctx.lines[s0 - 1:e0])):
+                return False
+        return True
 
     def method_users(self, path: str, qual: str, name: str) -> set[int] | None:
         """Tests that can see a method `name` appear in, or vanish from,
@@ -1201,6 +1297,19 @@ class Resolver:
         else:
             names = _targets(stmt)
             if names is None:
+                if path.startswith("sqlglot/") and not any(
+                        isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda))
+                        for n in ast.walk(stmt)):
+                    # an if/try/for at module level that defines no code: all
+                    # it can do is set module-level values (and import), which
+                    # the import-state probe compares. If the patched import
+                    # leaves them as they were, the statement did the same.
+                    if path in self.m.import_ok:
+                        return
+                    self.sel.everything = True
+                    self.sel.import_probe.setdefault(path, set()).add(stmt.lineno)
+                    self.sel.notes.append(f"module-level {type(stmt).__name__} {path}:{stmt.lineno} run at import")
+                    return
                 return self.module_fallback(path, f"module-level {type(stmt).__name__}")
         self.module_names(path, ctx, names, {id(stmt)}, depth)
 

@@ -323,7 +323,14 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
             continue
         try:
             signal.setitimer(signal.ITIMER_REAL, 60.0)
-            module = importlib.import_module(path[:-3].replace("/", "."))
+            # what importing creates lives as long as the child: no collector
+            # passes over it while importing, and none after (frozen)
+            gc.disable()
+            try:
+                module = importlib.import_module(path[:-3].replace("/", "."))
+            finally:
+                gc.enable()
+                gc.freeze()
             signal.setitimer(signal.ITIMER_REAL, 0)
         except BaseException as e:  # noqa: BLE001
             signal.setitimer(signal.ITIMER_REAL, 0)

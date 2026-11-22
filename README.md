@@ -60,6 +60,30 @@ ones against the patched code, and report only those that fail.
    - comment/format-only edits (identical AST) → nothing, beyond tests that
      read the file or look at code objects (bytecode is unchanged, only line
      numbers move); an encoding-line change counts as code;
+   - refactors proven from the two ASTs (`src/blast/refactor.py`) → the same
+     as a comment-only edit: a local variable renamed everywhere in its
+     function (not a parameter; no `locals()`/`eval`, no f-string `{x=}`); a
+     name renamed throughout the file when neither name appears in another
+     source file or in a string, and no name-built lookup (`<key>_sql`,
+     `getattr` with an f-string prefix) can reach it; runs of plain defs
+     reordered (decorators from a harmless list, no default, annotation or
+     decorator naming another def of the run); runs of imports reordered
+     when no name is bound twice. Reordered imports of sqlglot's own modules
+     in a module `import sqlglot` loads are checked with the import-state
+     probe (circular imports, registries filled in import order);
+   - a new class member that is a literal or a plainly decorated def, named
+     nowhere else, in a class whose creation hooks don't walk its namespace
+     → nothing (it shadows nothing and nothing reads it); a new module named
+     by no code → only tests that walk packages or directories, or start
+     subprocesses;
+   - edits only inside the bodies of module- or class-level lambdas (outside
+     any call) → tests that ran those lambda lines, when the edit is on
+     lines the import itself doesn't run (the lambda's first line runs when
+     it is created, and import-time lines are credited to no test);
+   - a module-level `if`/`try` that binds no name and defines no code, read
+     because a name it reads changed → decided by the import-state probe,
+     which ignores the names the patch assigns directly (their readers are
+     followed by name);
    - a patch that changes only one comparison (operator or literal operand)
      → only tests whose recorded operands (`data/cmp`, per test and site)
      could compare differently; a test that never evaluated it is unaffected.
@@ -110,7 +134,8 @@ ones against the patched code, and report only those that fail.
    - process pools run in-process, still going through pickle;
    - the parent freezes everything it preloaded out of the garbage
      collector, and children raise its threshold, so the collector runs far
-     less often;
+     less often; a child imports each test module with the collector off and
+     then freezes what that import created;
    - DuckDB answers recorded at the pinned commit (`data/duck.pkl.gz`) are
      reused when the patched sqlglot sends DuckDB the exact same SQL;
    - a slow test whose process-pool tasks were mapped one by one runs only
