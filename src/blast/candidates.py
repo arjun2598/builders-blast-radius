@@ -63,6 +63,7 @@ class Map:
         self.patched: dict | None = None  # path -> patched text, of the commit being selected
         self.subtask_raise = set(m.get("subtask_raise", ()))  # skipped tasks raise SkippedTask (see runner)
         self.cmp: cmpcheck.CmpMap | None = None  # comparison operands, set by the caller
+        self.bool: cmpcheck.CmpMap | None = None  # and/or operand truth values, set by the caller
         self.keys: cmpcheck.KeyMap | None = None  # dict keys read, set by the caller
         self.needs: dict | None = None  # module file -> tests that imported it, set by load_needs
         self.needs_mapped: set[int] = set()
@@ -641,6 +642,12 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
             edit = cmpcheck.find_edit(old_src, new_src, tree, new_tree)
         except Exception:  # noqa: BLE001
             edit = None
+    bool_edit = None
+    if edit is None and m.bool is not None and path.startswith("sqlglot/"):
+        try:
+            bool_edit = cmpcheck.find_bool_edit(old_src, new_src, tree, new_tree)
+        except Exception:  # noqa: BLE001
+            bool_edit = None
     res = Resolver(m, sel)
     if m.keys is not None and path.startswith("sqlglot/"):
         try:
@@ -684,6 +691,8 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
                 sel.notes.append(f"importers of {path} instead: {len(hit)} tests")
     if edit is not None:
         _narrow_compare(fd, edit, m, sel)
+    elif bool_edit is not None:
+        _narrow_bool(fd, bool_edit, m, sel)
     elif path.startswith("sqlglot/"):
         try:
             span = cmpcheck.find_handler_edit(old_src, new_src, tree, new_tree)
@@ -714,6 +723,24 @@ def _narrow_compare(fd: FileDiff, edit, m: Map, sel: Selection) -> None:
     sel.tests = m.drop_tasks_of(base - safe, m.cmp.mapped, base - safe) | set(m.opens.get(fd.path, ()))
     sel.notes.append(f"comparison edit {fd.path}:{edit.site[0]} {edit.op_old}->{edit.op_new}: "
                      f"{len(base)} -> {len(sel.tests)}")
+
+def _narrow_bool(fd: FileDiff, edit, m: Map, sel: Selection) -> None:
+    """As _narrow_compare, for a file whose only change rewrites one and/or
+    over the same operands: keep the tests whose recorded operand truth
+    values give a different result, or skip an operand with side effects."""
+    r = cmpcheck.narrow_bool(edit, fd.path, m.bool)
+    if r is None:
+        sel.notes.append(f"and/or edit {fd.path}:{edit.site[0]} not judged")
+        return
+    hit, safe = r
+    if sel.everything:
+        base = {t["number"] for t in m.tests} | m.all_subtasks()
+        sel.everything = False
+    else:
+        base = set(sel.tests)
+    sel.tests = m.drop_tasks_of(base - safe, m.bool.mapped, base - safe) | set(m.opens.get(fd.path, ()))
+    sel.notes.append(f"and/or edit {fd.path}:{edit.site[0]}: {len(base)} -> {len(sel.tests)}")
+
 
 def _direct_names(fd: FileDiff, ctx: "Ctx") -> set[str]:
     """Names bound by the module- and class-level statements the diff touches."""

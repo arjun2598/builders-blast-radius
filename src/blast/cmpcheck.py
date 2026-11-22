@@ -282,3 +282,184 @@ def find_handler_edit(old_src: str, new_src: str, old_tree: ast.AST, new_tree: a
                 return None
             return node.lineno, node.type.end_lineno
     return None
+
+
+# ---- and/or -----------------------------------------------------------------
+# The MAP_BOOL pass recorded, per test and per `and`/`or` used only for its
+# truth, each distinct vector of operand truths (1, 0, or None = skipped by
+# short-circuiting). An edit that only regroups the same operands with
+# and/or (a swapped operator) leaves a test as it was when, on every vector it
+# saw, the new expression has the same truth, needs no operand the old one
+# skipped, and skips no operand the old one evaluated unless that operand is
+# free of side effects (`self._match(...)` consumes tokens).
+
+class BoolEdit:
+    def __init__(self, old: ast.BoolOp, formula, pure: list[bool]):
+        self.old, self.formula, self.pure = old, formula, pure
+
+    @property
+    def site(self) -> tuple[int, int]:
+        return self.old.lineno, self.old.col_offset
+
+
+_PURE_CALLS = {"isinstance", "issubclass", "len", "bool", "type", "hasattr", "callable"}
+_PURE_METHODS = {"get", "startswith", "endswith", "isdigit", "isupper", "islower", "isidentifier"}
+
+
+def _pure(node) -> bool:
+    for n in ast.walk(node):
+        if isinstance(n, (ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom, ast.Lambda)):
+            return False
+        if isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Name) and f.id in _PURE_CALLS:
+                continue
+            if isinstance(f, ast.Attribute) and f.attr in _PURE_METHODS:
+                continue
+            return False
+    return True
+
+
+def _truth_context(chain: list) -> bool:
+    """chain[-1] is a node whose truth alone is used."""
+    node = chain[-1]
+    for parent in reversed(chain[:-1]):
+        if isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)) and parent.test is node:
+            return True
+        if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not):
+            return True
+        if isinstance(parent, ast.comprehension) and any(x is node for x in parent.ifs):
+            return True
+        if isinstance(parent, ast.BoolOp) and any(x is node for x in parent.values):
+            node = parent  # truth used if the enclosing and/or's truth is
+            continue
+        return False
+    return False
+
+
+def _chain_to(tree, target):
+    stack = [(tree, [tree])]
+    while stack:
+        n, path = stack.pop()
+        if n is target:
+            return path
+        for c in ast.iter_child_nodes(n):
+            stack.append((c, path + [c]))
+    return None
+
+
+def find_bool_edit(old_src: str, new_src: str, old_tree: ast.AST, new_tree: ast.AST) -> BoolEdit | None:
+    if old_src.count("\n") != new_src.count("\n"):
+        return None
+    out: list = []
+    _diffs(old_tree, new_tree, [], out, limit=1)
+    if not out:
+        return None  # the masked comparison below rules out other changes
+    a, _, parents = out[0]
+    chain = parents + [a]
+    x = next((n for n in reversed(chain) if isinstance(n, ast.BoolOp)), None)
+    if x is None:
+        return None
+    # the outermost and/or of the new tree starting where x starts
+    y = None
+    for n in ast.walk(new_tree):
+        if isinstance(n, ast.BoolOp) and (n.lineno, n.col_offset) == (x.lineno, x.col_offset):
+            y = n
+            break
+    if y is None or _masked(old_tree, x) != _masked(new_tree, y):
+        return None  # something else changed too
+    path = _chain_to(old_tree, x)
+    if path is None or not _truth_context(path):
+        return None
+    dumps = [ast.dump(v) for v in x.values]
+    pos = [0]
+
+    def formula(node):
+        i = pos[0]
+        if i < len(dumps) and ast.dump(node) == dumps[i]:
+            pos[0] += 1
+            return i
+        if isinstance(node, ast.BoolOp):
+            return (type(node.op).__name__, [formula(v) for v in node.values])
+        raise ValueError
+
+    try:
+        f = formula(y)
+    except (ValueError, RecursionError):
+        return None
+    if pos[0] != len(dumps):
+        return None
+    return BoolEdit(x, f, [_pure(v) for v in x.values])
+
+
+def _masked(tree, target) -> str:
+    # mask the node in place, dump, restore
+    holder = _chain_to(tree, target)
+    if holder is None or len(holder) < 2:
+        return ""
+    parent = holder[-2]
+    for field, value in ast.iter_fields(parent):
+        if value is target:
+            setattr(parent, field, ast.Constant("__blast_edit__"))
+            try:
+                return ast.dump(tree)
+            finally:
+                setattr(parent, field, target)
+        if isinstance(value, list):
+            for i, v in enumerate(value):
+                if v is target:
+                    value[i] = ast.Constant("__blast_edit__")
+                    try:
+                        return ast.dump(tree)
+                    finally:
+                        value[i] = target
+    return ""
+
+
+def _eval3(f, vec, used: set):
+    """Short-circuit truth of formula f over vec (None: unknown), noting
+    which operands it evaluates. Returns True/False/None."""
+    if isinstance(f, int):
+        used.add(f)
+        return None if vec[f] is None else bool(vec[f])
+    op, parts = f
+    for p in parts:
+        v = _eval3(p, vec, used)
+        if v is None:
+            return None
+        if (op == "And" and not v) or (op == "Or" and v):
+            return v
+    return op == "And"
+
+
+def bool_changes(e: BoolEdit, vec) -> bool:
+    if vec is None or len(vec) != len(e.pure):
+        return True
+    old_op = type(e.old.op).__name__
+    old_used: set = set()
+    old = _eval3((old_op, list(range(len(vec)))), vec, old_used)
+    used: set = set()
+    new = _eval3(e.formula, vec, used)
+    if old is None or new is None or new != old:
+        return True
+    return any(not e.pure[i] for i in old_used - used)
+
+
+def narrow_bool(e: BoolEdit, path: str, bm: CmpMap):
+    """As narrow(), for an and/or edit."""
+    data = bm.file(path)
+    if data is None or not bm.mapped:
+        return None
+    site = data.get(f"{path}:{e.site[0]}:{e.site[1]}")
+    if site is None:
+        return set(), set(bm.mapped)
+    obs = site["o"]
+    imp = site["i"]
+    if imp == "many" or (imp and any(bool_changes(e, obs[i]) for i in imp)):
+        return None
+    flips = [bool_changes(e, o) for o in obs]
+    hit = set(site["n"])
+    for idx, tests in site["g"]:
+        if any(flips[i] for i in idx):
+            hit.update(tests)
+    return hit, set(bm.mapped) - hit

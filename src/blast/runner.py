@@ -27,15 +27,75 @@ import unittest
 # lazy: run a task when its result is first asked for, so a test that
 # checks results in order and fails early (with failfast) skips the rest.
 _tasks: dict = {"n": 0, "only": None, "lazy": False, "raise": False}
+# Stage cuts (see blast.stagecut): task -> digest its cut must return for
+# the task to be skipped; counts of equal and differing digests; give up
+# (the test fails, so it is listed) when the first cuts all differ.
+_cut: dict = {"tasks": None, "want": None, "eq": 0, "ne": 0, "giveup": False, "target": None}
+_SKIP = object()
+GIVE_UP_AFTER = 3
 
 
-def _call(blob):
+class _CutEqual(Exception):
+    pass
+
+
+class CutGiveUp(Exception):
+    """The first stage cuts of a test all differ: running it whole would
+    cost more than listing it."""
+
+
+def _cut_wrapper(real):
+    from . import stagecut
+
+    def cut(*a, **k):
+        out = real(*a, **k)
+        want, _cut["want"] = _cut["want"], None
+        if want is not None:
+            if stagecut.digest(out) == want:
+                raise _CutEqual
+            _cut["ne"] += 1
+            if _cut["giveup"] and _cut["ne"] >= GIVE_UP_AFTER and not _cut["eq"]:
+                raise CutGiveUp
+        return out
+
+    cut._blast_cut = True
+    return cut
+
+
+def _install_cut() -> None:
+    mod_name, attr = _cut["target"].split(":")
+    mod = importlib.import_module(mod_name)
+    if not getattr(getattr(mod, attr), "_blast_cut", False):
+        setattr(mod, attr, _cut_wrapper(getattr(mod, attr)))
+
+
+def _call(blob, want=None):
     fn, args, kwargs = pickle.loads(blob)
-    return pickle.loads(pickle.dumps(fn(*args, **kwargs)))
+    if want is None:
+        return pickle.loads(pickle.dumps(fn(*args, **kwargs)))
+    _install_cut()
+    _cut["want"] = want
+    try:
+        out = fn(*args, **kwargs)
+    except _CutEqual:
+        _cut["eq"] += 1
+        return _SKIP
+    finally:
+        _cut["want"] = None
+    return pickle.loads(pickle.dumps(out))
 
 
-def _lazy_future(blob):
+def _skipped(fut):
+    if _tasks["raise"]:
+        fut.set_exception(SkippedTask())
+    else:
+        fut.set_result(None)
+
+
+def _lazy_future(blob, want=None):
     from concurrent.futures import Future
+
+    raising = _tasks["raise"]
 
     class LazyFuture(Future):
         _blob = blob
@@ -44,7 +104,14 @@ def _lazy_future(blob):
             if self._blob is not None:
                 b, self._blob = self._blob, None
                 try:
-                    self.set_result(_call(b))
+                    out = _call(b, want)
+                    if out is _SKIP:
+                        if raising:
+                            self.set_exception(SkippedTask())
+                        else:
+                            self.set_result(None)
+                    else:
+                        self.set_result(out)
                 except BaseException as e:  # noqa: BLE001
                     self.set_exception(e)
 
@@ -81,16 +148,18 @@ class SyncExecutor:
         n = _tasks["n"]
         _tasks["n"] = n + 1
         if _tasks["only"] is not None and n not in _tasks["only"]:
-            if _tasks["raise"]:
-                fut.set_exception(SkippedTask())
-            else:
-                fut.set_result(None)
+            _skipped(fut)
             return fut
+        want = _cut["tasks"].get(n) if _cut["tasks"] else None
         try:
             blob = pickle.dumps((fn, args, kwargs))
             if _tasks["lazy"]:
-                return _lazy_future(blob)
-            fut.set_result(_call(blob))
+                return _lazy_future(blob, want)
+            out = _call(blob, want)
+            if out is _SKIP:
+                _skipped(fut)
+            else:
+                fut.set_result(out)
         except BaseException as e:  # noqa: BLE001
             fut.set_exception(e)
         return fut
@@ -142,8 +211,9 @@ def _pack_cost(ms: list[int]) -> float:
 
 class Result(unittest.TestResult):
     def __init__(self, ids: dict, timeouts: dict, stop_first: bool, subsets: dict | None = None,
-                 lazy: set | None = None, raising: set | None = None):
+                 lazy: set | None = None, raising: set | None = None, cuts: dict | None = None):
         super().__init__()
+        self.cuts = cuts or {}  # nodeid -> ({task: digest}, give up?)
         self.subsets = subsets or {}
         self.lazy = lazy or set()
         self.raising = raising or set()  # nodeids whose skipped tasks raise SkippedTask
@@ -210,6 +280,8 @@ class Result(unittest.TestResult):
         _tasks["n"], _tasks["only"] = 0, (set(sub) if sub is not None else None)
         _tasks["lazy"] = self.ids.get(id(test)) in self.lazy
         _tasks["raise"] = sub is not None and self.ids.get(id(test)) in self.raising
+        cut = self.cuts.get(self.ids.get(id(test)))
+        _cut.update(tasks=cut[0] if cut else None, giveup=bool(cut and cut[1]), eq=0, ne=0, want=None)
         # skipped tasks fail their subTests on purpose: fail-fast would end
         # the test at the first of them
         self.failfast = self.stop_first and not _tasks["raise"]
@@ -218,6 +290,9 @@ class Result(unittest.TestResult):
     def stopTest(self, test):
         signal.setitimer(signal.ITIMER_REAL, 0)
         _tasks["n"], _tasks["only"], _tasks["lazy"], _tasks["raise"] = 0, None, False, False
+        if _cut["tasks"] and os.environ.get("BLAST_DEBUG_CUT"):
+            print(f"cut {self.ids.get(id(test))}: equal {_cut['eq']} differ {_cut['ne']}", file=sys.__stderr__)
+        _cut.update(tasks=None, giveup=False, want=None)
         self.failfast = self.stop_first
         nid = self.ids.get(id(test))
         if nid:
@@ -255,7 +330,7 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
         timeouts: dict[str, float], out_path: str, stop_first: bool = True,
         subsets: dict[str, list[int]] | None = None, duck: str | None = None,
         lazy: set[str] | None = None, costs: dict | None = None, listed: list[int] | None = None,
-        raising: set[str] | None = None) -> None:
+        raising: set[str] | None = None, cuts: dict | None = None, cut_target: str | None = None) -> None:
     """subsets: nodeid -> the only pool tasks to run (the map says no other
     task can see the change). duck: recorded DuckDB answers to reuse."""
     os.chdir(workdir)
@@ -305,7 +380,8 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
         order.setdefault(parts[0], {}).setdefault(parts[1], []).append((nid, parts[2]))
 
     ids: dict[int, str] = {}
-    result = Result(ids, timeouts, stop_first, subsets, lazy, raising)
+    _cut["target"] = cut_target
+    result = Result(ids, timeouts, stop_first, subsets, lazy, raising, cuts if cut_target else None)
     result.costs = costs or {}
     result.listed = list(listed or ())
     failed: set[str] = set()

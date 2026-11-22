@@ -32,10 +32,14 @@ CPU_TABLE = Path(os.environ.get("BLAST_CPU", "/app/data/cpu.json"))
 DUCK = Path(os.environ.get("BLAST_DUCK", "/app/data/duck.pkl.gz"))
 CMP = Path(os.environ.get("BLAST_CMPMAP", "/app/data/cmp"))
 KEYS = Path(os.environ.get("BLAST_KEYMAP", "/app/data/keys"))
+BOOL = Path(os.environ.get("BLAST_BOOLMAP", "/app/data/bool"))
 NEEDS = Path(os.environ.get("BLAST_NEEDS", "/app/data/imports.json.gz"))
 POPEN = Path(os.environ.get("BLAST_POPEN", "/app/data/popen.json"))
 PREBUILT = Path(os.environ.get("BLAST_PREBUILT", "/app/prebuilt.pkl"))
 DISP = Path(os.environ.get("BLAST_DISP", "/app/data/disp.json.gz"))
+STAGE = Path(os.environ.get("BLAST_STAGE", "/app/data/stage.json.gz"))
+CUT_COST = 1.15  # a stage cut's CPU, digest included, over its measured CPU
+CUT_GIVE_UP = 8  # tests with at least this many cut tasks give up early (runner.CutGiveUp)
 SUB_BASE = 10_000_000  # map numbers of single pool tasks, see build_map.py
 SLOW = float(os.environ.get("BLAST_SLOW", "5.0"))  # CPU s: report unrun at/above this
 CPU_SCALE = float(os.environ.get("BLAST_CPU_SCALE", "1.2"))  # scorer box vs where cpu.json was measured
@@ -116,6 +120,7 @@ class Commit:
         self.ok = True
         self.subsets: dict[int, list[int]] = {}  # test -> the only pool tasks to run
         self.duck = False  # recorded DuckDB answers still valid
+        self.cuts: dict[int, dict[int, str]] = {}  # test -> {pool task: digest its stage cut must give}
 
 
 def prepare(c: Commit, m: candidates.Map, all_tests: list[dict], cm: "CostModel") -> None:
@@ -177,6 +182,7 @@ def prepare(c: Commit, m: candidates.Map, all_tests: list[dict], cm: "CostModel"
             for p, idx in tasks.items():
                 if p in m.subtasks and len(idx) < m.subtasks[p]:
                     c.subsets[p] = sorted(idx)
+            _stage_cuts(c, m, diffs, old, cands)
     except Exception as e:  # noqa: BLE001
         log(c.id, "prepare failed, running everything:", repr(e))
         cands = set(secs)
@@ -184,12 +190,43 @@ def prepare(c: Commit, m: candidates.Map, all_tests: list[dict], cm: "CostModel"
     if not c.ok:
         c.report = set(cands)
         return
-    c.report, c.run = cm.decide(cands, c.new_files, c.subsets, c.duck)
+    c.report, c.run = cm.decide(cands, c.new_files, c.subsets, c.duck, c.cuts)
     for t in list(c.subsets):
         if t not in c.run:
             del c.subsets[t]
+    for t in list(c.cuts):
+        if t not in c.run:
+            del c.cuts[t]
     if c.subsets:
         log(c.id, "tasks:", {t: len(v) for t, v in c.subsets.items()})
+    if c.cuts:
+        log(c.id, "stage cuts:", {t: len(v) for t, v in c.cuts.items()})
+
+
+def _stage_cuts(c: "Commit", m: candidates.Map, diffs, old: dict, cands: set[int]) -> None:
+    """Pool tasks that only need running up to their stage cut: every
+    function the change touches ran, for that task at the pinned commit,
+    only inside the cut (see blast.stagecut)."""
+    stage = getattr(m, "stage", None)
+    if not stage or not cands & set(stage):
+        return
+    from . import stagecut
+
+    spans = {}
+    for fd in diffs:
+        if fd.old_path != fd.new_path or not old.get(fd.old_path):
+            return
+        fs = stagecut.changed_functions(old[fd.old_path], fd.changed_old_lines())
+        if not fs:
+            return
+        spans[fd.old_path] = fs
+    for t in cands & set(stage):
+        tasks = stage[t]
+        idx = c.subsets.get(t, range(len(tasks)))
+        cut = {i: tasks[i]["digest"] for i in idx
+               if i < len(tasks) and tasks[i] and stagecut.cuttable(tasks[i], spans)}
+        if cut:
+            c.cuts[t] = cut
 
 
 _origin_state: dict = {}
@@ -395,9 +432,17 @@ class CostModel:
             log("no cpu table, using recorded seconds:", repr(e))
             self.cpu, self.cls, self.mod, self.sub, self.duck = {}, {}, {}, {}, {}
         self.subsets: dict[int, list[int]] = {}  # of the commit being costed
+        self.cuts: dict[int, dict] = {}  # of the commit being costed
+        self.cut_cpu: dict[int, list[float]] = {}  # test -> CPU of each pool task's stage cut
         self.use_duck = False
 
     def test_cpu(self, t: int) -> float:
+        if t in self.cuts and t in self.sub and t in self.cut_cpu:
+            fixed, per = self.sub[t]
+            cut, cc = self.cuts[t], self.cut_cpu[t]
+            idx = self.subsets.get(t, range(len(per)))
+            return fixed + sum((cc[i] * CPU_SCALE * CUT_COST if i in cut and i < len(cc) else per[i])
+                               for i in idx if i < len(per))
         if t in self.subsets and t in self.sub:
             fixed, per = self.sub[t]
             return fixed + sum(per[i] for i in self.subsets[t] if i < len(per))
@@ -417,7 +462,7 @@ class CostModel:
                 + sum(self.mod.get(f, 0.05) for f in files))
 
     def commit_cpu(self, c: "Commit") -> float:
-        self.subsets, self.use_duck = c.subsets, c.duck
+        self.subsets, self.use_duck, self.cuts = c.subsets, c.duck, c.cuts
         return self.run_cpu(c.run, True)
 
     def pack_cost(self, tests) -> float:
@@ -426,23 +471,66 @@ class CostModel:
             return 0.0
         return (max(sum(self.ms[t] for t in w) for w in workers) + WORKER_COST_MS * len(workers)) / 1000
 
-    def decide(self, cands: set[int], changed: dict, subsets=None, duck=False) -> tuple[set[int], list[int]]:
+    def decide(self, cands: set[int], changed: dict, subsets=None, duck=False, cuts=None) -> tuple[set[int], list[int]]:
         """Split candidates into (report unrun, run). Tests whose CPU exceeds
         what listing them would cost go unrun; then pick the cheaper of
         listing everything vs. running the rest and reporting what fails."""
-        self.subsets, self.use_duck = subsets or {}, duck
+        self.subsets, self.use_duck, self.cuts = subsets or {}, duck, cuts or {}
         if not cands:
             return set(), []
         slow = {t for t in cands if self.test_cpu(t) >= max(SLOW, self.secs[t])}
         rest = cands - slow
         purge = any(f.endswith(".py") for f in changed)
-        list_all = self.pack_cost(cands)
-        expect_fail = (P_FAIL * (WORKER_COST_MS / 1000 + 0.2)) if not slow else 0.3
-        run_rest = self.run_cpu(rest, purge) + self.pack_cost(slow) + expect_fail
-        if not rest or list_all <= run_rest:
+        if not rest:
             return set(cands), []
-        order = sorted(rest, key=lambda t: (self.test_cpu(t), t))
-        return slow, order
+        # Which tests to list unrun: listing one costs its share of the
+        # packed simulated time, running it costs CPU. Try listing the tests
+        # dearest to run per listed second first, in growing prefixes, from
+        # none of them to all, and keep the cheapest plan.
+        cpu = {t: self.test_cpu(t) for t in rest}
+        by_ratio = sorted(rest, key=lambda t: (-cpu[t] / max(self.secs[t], 1e-3), t))
+        n = len(by_ratio)
+        ks = sorted({0, n} | {min(n, round(n * q)) for q in (0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.85, 0.95)}
+                    | set(range(min(n, 12))))
+        best = None
+        for k in ks:
+            listed = slow | set(by_ratio[:k])
+            run = by_ratio[k:]
+            cost = self.approx_pack(listed)
+            if run:
+                # a failure among the run tests is reported too: into a
+                # worker of its own unless some are listed anyway
+                cost += self.run_cpu(run, purge) + (0.3 if listed else P_FAIL * (WORKER_COST_MS / 1000 + 0.2))
+            if best is None or cost < best[0] - 1e-9:
+                best = (cost, k)
+        k = best[1]
+        if k >= n:
+            return set(cands), []
+        order = sorted(by_ratio[k:], key=lambda t: (cpu[t], t))
+        return slow | set(by_ratio[:k]), order
+
+    def approx_pack(self, tests) -> float:
+        """pack_cost without packing: the largest of the biggest test and an
+        even split, plus the worker cost, at the best worker count."""
+        if not tests:
+            return 0.0
+        loads = [self.ms[t] for t in tests]
+        top, total = max(loads), sum(loads)
+        return min(max(top, total / k) + WORKER_COST_MS * k for k in range(1, min(8, len(loads)) + 1)) / 1000
+
+
+def load_stage(path: Path, by_id: dict):
+    """data/stage.json.gz (tools/stage_map.py): test -> per-task stage data."""
+    try:
+        import gzip
+
+        d = json.loads(gzip.decompress(path.read_bytes()))
+    except Exception as e:  # noqa: BLE001
+        log("no stage map:", repr(e))
+        return {}, None, {}
+    stage = {by_id[k]: v for k, v in d["tests"].items() if k in by_id and any(v)}
+    cpu = {t: [x["cpu_cut"] if x else 0.0 for x in v] for t, v in stage.items()}
+    return stage, d["cut"], cpu
 
 
 def main() -> None:
@@ -465,9 +553,14 @@ def main() -> None:
         from . import cmpcheck
 
         m.keys = cmpcheck.KeyMap(str(KEYS))
+    if BOOL.is_dir():
+        from . import cmpcheck
+
+        m.bool = cmpcheck.CmpMap(str(BOOL))
     m.load_needs(str(NEEDS))
     m.load_popen(str(POPEN))
     m.load_disp(str(DISP))
+    m.stage, m.stage_target, stage_cpu = load_stage(STAGE, by_id)
     for f in list(REPO.glob("sqlglot/**/*.py")) + list(REPO.glob("tests/**/*.py")):
         m.sources[str(f.relative_to(REPO))] = f.read_text()
     from . import prebuild
@@ -492,6 +585,7 @@ def main() -> None:
     peak_mb = [0.0]
     last_ru = [0.0]
     cm = CostModel(tests, CPU_TABLE)
+    cm.cut_cpu = stage_cpu
     for c in commits:
         prepare(c, m, tests, cm)
 
@@ -574,6 +668,8 @@ def main() -> None:
                                # them: a lazy one would never finish
                                lazy={ids[t] for t in m.subtasks if t in ids and t not in m.subtask_raise},
                                raising={ids[t] for t in m.subtask_raise if t in ids},
+                               cuts={ids[t]: (v, len(v) >= CUT_GIVE_UP) for t, v in c.cuts.items()},
+                               cut_target=m.stage_target,
                                costs={ids[t]: (cm.test_cpu(t), ms[t]) for t in c.run},
                                listed=[ms[t] for t in c.report])
                 except BaseException as e:  # noqa: BLE001

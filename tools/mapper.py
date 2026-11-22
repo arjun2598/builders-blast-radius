@@ -319,11 +319,107 @@ class _CmpRewrite(_ast.NodeTransformer):
         return _ast.copy_location(call, node)
 
 
-def _install_cmp():
+# With MAP_BOOL=1 every `and`/`or` whose value is only used for its truth
+# (if/while/assert tests, ternary tests, `not`, comprehension filters, and
+# operands of such) records per evaluation which operands came out true (1),
+# false (0) or were skipped by short-circuiting (None), in the same
+# per-test, per-site structure as the comparisons. Operand i is wrapped as
+# __blast_bb__(site, i, n, operand) and the whole as __blast_bend__(site, ...),
+# which keeps short-circuiting and walrus bindings; evaluations in progress
+# are told apart by the frame evaluating them.
+
+_bool_active: dict = {}
+
+
+def _bb(site, i, n, v):
+    k = (site, id(sys._getframe(1)))
+    if i == 0:
+        vec = _bool_active[k] = [None] * n
+    else:
+        vec = _bool_active.get(k)
+        if vec is None:
+            return v
+    try:
+        vec[i] = 1 if v else 0
+    except Exception:  # noqa: BLE001
+        _bool_active.pop(k, None)
+    return v
+
+
+def _bend(site, v):
+    vec = _bool_active.pop((site, id(sys._getframe(1))), None)
+    per = _cmp.get(_key)
+    if per is None:
+        per = _cmp[_key] = {}
+    obs = per.get(site, 0)
+    if obs is not None:
+        if obs == 0:
+            obs = per[site] = set()
+        if vec is None:
+            per[site] = None  # lost track (exception inside an operand): no claim
+        else:
+            obs.add(tuple(vec))
+            if len(obs) > CMP_CAP:
+                per[site] = None
+    return v
+
+
+class _BoolRewrite(_ast.NodeTransformer):
+    def __init__(self, rel):
+        self.rel = rel
+
+    def _truth(self, node):
+        if isinstance(node, _ast.BoolOp):
+            node.values = [self._truth(self.visit(v)) if isinstance(v, _ast.BoolOp) else self.visit(v)
+                           for v in node.values]
+            site = f"{self.rel}:{node.lineno}:{node.col_offset}"
+            n = len(node.values)
+            node.values = [_ast.copy_location(_ast.Call(
+                func=_ast.Name("__blast_bb__", _ast.Load()),
+                args=[_ast.Constant(site), _ast.Constant(i), _ast.Constant(n), v], keywords=[]), v)
+                for i, v in enumerate(node.values)]
+            return _ast.copy_location(_ast.Call(func=_ast.Name("__blast_bend__", _ast.Load()),
+                                                args=[_ast.Constant(site), node], keywords=[]), node)
+        return self.visit(node)
+
+    def visit_If(self, node):
+        node.test = self._truth(node.test)
+        node.body = [self.visit(x) for x in node.body]
+        node.orelse = [self.visit(x) for x in node.orelse]
+        return node
+
+    visit_While = visit_If
+
+    def visit_IfExp(self, node):
+        node.test = self._truth(node.test)
+        node.body, node.orelse = self.visit(node.body), self.visit(node.orelse)
+        return node
+
+    def visit_Assert(self, node):
+        node.test = self._truth(node.test)
+        if node.msg is not None:
+            node.msg = self.visit(node.msg)
+        return node
+
+    def visit_UnaryOp(self, node):
+        if isinstance(node.op, _ast.Not):
+            node.operand = self._truth(node.operand)
+            return node
+        return self.generic_visit(node)
+
+    def visit_comprehension(self, node):
+        node.target, node.iter = self.visit(node.target), self.visit(node.iter)
+        node.ifs = [self._truth(x) for x in node.ifs]
+        return node
+
+
+def _install_cmp(bool_mode=False):
     import tempfile
     from importlib.machinery import SourceFileLoader
 
     _builtins.__blast_cmp__ = _bc
+    _builtins.__blast_bb__ = _bb
+    _builtins.__blast_bend__ = _bend
     sys.pycache_prefix = tempfile.mkdtemp(prefix="cmp_pyc")  # never reuse plain bytecode
     orig = SourceFileLoader.source_to_code
 
@@ -331,7 +427,7 @@ def _install_cmp():
         rel = _rel(path) if isinstance(path, str) else None
         if not rel or not rel.startswith("sqlglot/"):
             return orig(self, data, path, *a, **k)
-        tree = _CmpRewrite(rel).visit(_ast.parse(data, path))
+        tree = (_BoolRewrite if bool_mode else _CmpRewrite)(rel).visit(_ast.parse(data, path))
         _ast.fix_missing_locations(tree)
         return compile(tree, path, "exec", dont_inherit=True)
 
@@ -340,6 +436,8 @@ def _install_cmp():
 
 if os.environ.get("MAP_CMP") == "1":
     _install_cmp()
+elif os.environ.get("MAP_BOOL") == "1":
+    _install_cmp(bool_mode=True)
 
 
 # ---- dictionary keys -------------------------------------------------------

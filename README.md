@@ -89,6 +89,11 @@ ones against the patched code, and report only those that fail.
      could compare differently; a test that never evaluated it is unaffected.
      `==` vs `is` is judged only for literals, identity-equality types and
      members of one enum;
+   - a patch that only rewrites one `and`/`or` over the same operands, in
+     the same order (`a and b` → `a or b`, regrouping) → only tests whose
+     recorded operand truth values (`data/bool`, per test and site) give a
+     different result, or that would now skip or newly evaluate an operand
+     that isn't a plain attribute, name or pure builtin call;
    - a patch that changes only one value of a class-level dict literal →
      tests that read that key's value (`data/keys`) instead of every reader
      of the dict, unless the key was read at import time;
@@ -222,6 +227,26 @@ MAP_KEYS=1 ../venv/bin/python ../../tools/mapper_fork.py ../../blast-radius-samp
 MAP_KEYS=1 ../venv/bin/python ../../tools/mapper_fork.py ../../blast-radius-sample/sample/tests.json ../rawkeyssplit 7 1
 cd ../.. && python3 tools/build_cmp.py work/rawcmp work/rawcmpsplit blast-radius-sample/sample/tests.json data/map.json.gz data/cmp
 python3 tools/build_keys.py work/rawkeys work/rawkeyssplit blast-radius-sample/sample/tests.json data/map.json.gz data/keys
+```
+
+The same pass with `MAP_BOOL=1` (into `../rawbool` and `../rawboolsplit`)
+records the truth value of every operand of `and`/`or` in a truth context;
+`tools/build_cmp.py` turns it into `data/bool`.
+
+Stage cuts for the TPC executor tasks (`data/stage.json.gz`). Each pool task
+runs alone with line tracing. Lines run inside `optimize` (or the test's
+`parse_one`) are counted apart from all others: setup, pickling, planning,
+Python execution and the DuckDB check. A digest of the optimized
+expression is recorded with them, plus the CPU of each task and of its
+optimize call. When every function a code change touches ran only inside
+`optimize` for a task, the runner runs that task only up to `optimize` and
+compares the digest. If it matches, the rest would run as at the pinned
+commit, so the task is skipped. Otherwise the task runs in full. If the
+first few digests of a big test all differ, the test is given up on and
+listed:
+
+```sh
+cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=../../src ../venv/bin/python ../../tools/stage_map.py ../../data/stage.json.gz 7
 ```
 
 The generator dispatch map:
