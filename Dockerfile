@@ -27,6 +27,7 @@ COPY src /app/src
 COPY data /app/data
 RUN python -m compileall -q /app/src >/dev/null \
  && cd /app && PYTHONPATH=/app/src python -m blast.prebuild /opt/sqlglot /app/prebuilt.pkl /app/data/map.json.gz \
+ && (PYTHONPATH=/app/src PYTHONPYCACHEPREFIX=/opt/pyc python -m blast.xcache /opt/sqlglot /app/xcache.pkl || true) \
  && chmod -R a+rX /app /opt
 
 WORKDIR /app

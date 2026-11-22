@@ -174,6 +174,17 @@ ones against the patched code, and report only those that fail.
      and runs every sqlglot line the real test runs (`data/proxy.json`); only
      those stand-ins are used, and the cost model prices the test at the
      stand-in's cost;
+   - TestExecutor's class setup reads sixteen TPC CSV files and converts
+     every value in pure Python before any of its tests can run. Only the
+     test file, the test helpers, the CSV bytes and the standard library
+     decide the rows it builds, so the image build runs it once and stores
+     them (`python -m blast.xcache`, `/app/xcache.pkl`). That step also
+     checks, in fresh children, that the stored path leaves the class in the
+     same state: tables, value types, DuckDB views and the statements sent,
+     query lists and attributes. A child uses it only when the patch leaves
+     all of those inputs alone and adds no top-level module. It still builds
+     each Table with the patched class, and creates the DuckDB views at
+     first use (still part of the recorded-answer key);
    - after a failure the rest of that test file is listed without running
      (failures cluster by file). Other files keep running while their
      estimated CPU is below the simulated time listing them would add, given
@@ -187,6 +198,10 @@ ones against the patched code, and report only those that fail.
 5. **Pack**: what gets reported is split across workers to minimise the
    busiest worker's time plus 2 s per worker. Once every line is written and every
    child reaped, the process exits without the interpreter's teardown.
+
+Children run one at a time while the batch is on schedule: on the scorer's
+two CPUs (often two threads of one core) two children at once each burn more
+CPU seconds. Past 30 s both slots run.
 
 Any error falls back to listing all candidates, so a crash costs time, never
 a miss. A child whose resident memory passes 1.4 GB is killed the same way,

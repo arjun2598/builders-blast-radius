@@ -328,12 +328,22 @@ def _repoint(workdir: str, origin: str) -> None:
             pass
 
 
+def _xcache(path: str, cls_name: str, cls, store: str) -> None:
+    from . import xcache
+
+    if path == xcache.FILE and cls_name == xcache.CLASS:
+        try:
+            xcache.install(cls, store)  # class setup from stored rows (see blast.xcache)
+        except Exception as e:  # noqa: BLE001
+            print(f"xcache not installed: {e!r}", file=sys.stderr)
+
+
 def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
         timeouts: dict[str, float], out_path: str, stop_first: bool = True,
         subsets: dict[str, list[int]] | None = None, duck: str | None = None,
         lazy: set[str] | None = None, costs: dict | None = None, listed: list[int] | None = None,
         raising: set[str] | None = None, cuts: dict | None = None, cut_target: str | None = None,
-        keep: set[str] | None = None, proxied: set[str] | None = None) -> None:
+        keep: set[str] | None = None, proxied: set[str] | None = None, xcache: str | None = None) -> None:
     """subsets: nodeid -> the only pool tasks to run (the map says no other
     task can see the change). duck: recorded DuckDB answers to reuse."""
     os.chdir(workdir)
@@ -422,6 +432,8 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
         suite = unittest.TestSuite()
         for cls_name, tests in classes.items():
             cls = getattr(module, cls_name, None)
+            if xcache and cls is not None:
+                _xcache(path, cls_name, cls, xcache)
             for nid, meth in tests:
                 if cls is None or not hasattr(cls, meth):
                     failed.add(nid)
@@ -473,6 +485,8 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
             cls = getattr(_run_mods[path], cls_name, None)
             if cls is None or not hasattr(cls, meth):
                 continue
+            if xcache:
+                _xcache(path, cls_name, cls, xcache)
             if nid in (proxied or ()):
                 from . import proxies
 

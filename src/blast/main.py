@@ -28,6 +28,7 @@ MAP = Path(os.environ.get("BLAST_MAP", "/app/data/map.json.gz"))
 PYC = os.environ.get("BLAST_PYC", "/opt/pyc")
 TMP = Path(os.environ.get("BLAST_TMP", "/tmp"))
 SLOTS = int(os.environ.get("BLAST_SLOTS", "2"))
+PAR_AFTER = float(os.environ.get("BLAST_PAR_AFTER", "30"))  # s: past this, run SLOTS children at once
 CPU_TABLE = Path(os.environ.get("BLAST_CPU", "/app/data/cpu.json"))
 DUCK = Path(os.environ.get("BLAST_DUCK", "/app/data/duck.pkl.gz"))
 CMP = Path(os.environ.get("BLAST_CMPMAP", "/app/data/cmp"))
@@ -38,6 +39,7 @@ SIBLING = Path(os.environ.get("BLAST_SIBLING", "/app/data/sibling.json"))
 PROXY = Path(os.environ.get("BLAST_PROXY", "/app/data/proxy.json"))
 NEEDS = Path(os.environ.get("BLAST_NEEDS", "/app/data/imports.json.gz"))
 POPEN = Path(os.environ.get("BLAST_POPEN", "/app/data/popen.json"))
+XCACHE = Path(os.environ.get("BLAST_XCACHE", "/app/xcache.pkl"))
 POPEN_LINES = Path(os.environ.get("BLAST_POPEN_LINES", "/app/data/popen_lines.json"))
 PREBUILT = Path(os.environ.get("BLAST_PREBUILT", "/app/prebuilt.pkl"))
 DISP = Path(os.environ.get("BLAST_DISP", "/app/data/disp.json.gz"))
@@ -444,6 +446,8 @@ class CostModel:
         self.cut_cpu: dict[int, list[float]] = {}  # test -> CPU of each pool task's stage cut
         self.use_duck = False
         self.proxy: dict[int, float] = {}  # tests run as their stand-in (blast.proxies) -> CPU
+        self.xc_cpu: float | None = None  # TestExecutor's class setup from stored rows (blast.xcache)
+        self.xc_on = False  # of the commit being costed
 
     def test_cpu(self, t: int) -> float:
         if t in self.proxy:
@@ -469,11 +473,13 @@ class CostModel:
         files = {c.split("::")[0] for c in classes}
         return (BASE_CPU + (IMPORT_CPU if purge else 0.0)
                 + sum(self.test_cpu(t) for t in tests)
-                + sum(self.cls.get(c, 0.0) for c in classes)
+                + sum((self.xc_cpu if self.xc_on and self.xc_cpu is not None and c == XC_NODE
+                       else self.cls.get(c, 0.0)) for c in classes)
                 + sum(self.mod.get(f, 0.05) for f in files))
 
     def commit_cpu(self, c: "Commit") -> float:
         self.subsets, self.use_duck, self.cuts = c.subsets, c.duck, c.cuts
+        self.xc_on = _xc_usable(c.new_files)
         return self.run_cpu(c.run, True)
 
     def pack_cost(self, tests) -> float:
@@ -487,6 +493,7 @@ class CostModel:
         what listing them would cost go unrun; then pick the cheaper of
         listing everything vs. running the rest and reporting what fails."""
         self.subsets, self.use_duck, self.cuts = subsets or {}, duck, cuts or {}
+        self.xc_on = _xc_usable(changed)
         if not cands:
             return set(), []
         slow = {t for t in cands if self.test_cpu(t) >= max(SLOW, self.secs[t])}
@@ -508,6 +515,15 @@ class CostModel:
         loads = [self.ms[t] for t in tests]
         top, total = max(loads), sum(loads)
         return min(max(top, total / k) + WORKER_COST_MS * k for k in range(1, min(8, len(loads)) + 1)) / 1000
+
+
+XC_NODE = "tests/test_executor.py::TestExecutor"
+
+
+def _xc_usable(changed) -> bool:
+    from . import xcache
+
+    return xcache.usable(list(changed))
 
 
 def load_stage(path: Path, by_id: dict):
@@ -592,6 +608,14 @@ def main() -> None:
                     if k in by_id}
     except Exception as e:  # noqa: BLE001
         log("no proxies:", repr(e))
+    try:  # TestExecutor's class setup from rows stored at image build
+        from . import xcache
+
+        meta = xcache.load_meta(str(XCACHE), str(REPO))
+        if meta is not None and XCACHE.exists():
+            cm.xc_cpu = meta["cpu"] * CPU_SCALE + 0.05
+    except Exception as e:  # noqa: BLE001
+        log("no xcache:", repr(e))
     for c in commits:
         prepare(c, m, tests, cm)
 
@@ -651,7 +675,11 @@ def main() -> None:
 
     while queue or running:
         elapsed = time.monotonic() - START
-        while queue and free:
+        # One child at a time while on schedule: two children on the scorer's
+        # two CPUs (often two threads of one core) each burn more CPU seconds,
+        # and CPU seconds are scored. Behind schedule, both slots run.
+        par = SLOTS if elapsed > PAR_AFTER else 1
+        while queue and free and len(running) < par:
             c = queue.pop(0)
             est = cm.commit_cpu(c) * 1.3 + 1
             if elapsed + est / SLOTS > budget:
@@ -678,6 +706,7 @@ def main() -> None:
                                cut_target=m.stage_target,
                                # worth running after their file had a failure
                                proxied={ids[t] for t in c.run if t in cm.proxy},
+                               xcache=str(XCACHE) if cm.xc_cpu is not None and _xc_usable(c.new_files) else None,
                                keep={ids[t] for t in c.run if t in prior
                                      and prior[t] * ms[t] / 1000 > cm.test_cpu(t) + 0.3},
                                costs={ids[t]: (cm.test_cpu(t), ms[t]) for t in c.run},

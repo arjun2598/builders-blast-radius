@@ -39,6 +39,7 @@ class _Result:
 
     def _run(self):
         if self._real is None:
+            self._conn._flush()
             self._real = self._conn._raw.execute(self._sql, *self._args)
         return self._real
 
@@ -63,6 +64,18 @@ class _Conn:
     def __init__(self, raw):
         self._raw = raw
         self._hist = hashlib.sha1()
+        self._pending: list[str] = []
+
+    def defer(self, sql: str) -> None:
+        """A statement known to succeed (blast.xcache's views): part of the
+        history now, run in DuckDB only before the first statement that
+        really runs."""
+        self._hist.update(b"\0" + _norm(sql).encode() + repr(()).encode())
+        self._pending.append(sql)
+
+    def _flush(self) -> None:
+        while self._pending:
+            self._raw.execute(self._pending.pop(0))
 
     def execute(self, sql, *args):
         if isinstance(sql, str) and not args and sql.lstrip().upper().startswith(_READ):
@@ -74,11 +87,15 @@ class _Conn:
         else:
             self._hist.update(b"\0?")  # unknown statement: nothing after it can hit
             self._hist.update(os.urandom(8))
+        self._flush()
         return self._raw.execute(sql, *args)
 
     def __getattr__(self, name):
         # anything else (relation API, cursor, ...) poisons the history
+        if name == "close":
+            return self._raw.close
         self._hist.update(os.urandom(8))
+        self._flush()
         return getattr(self._raw, name)
 
     def __enter__(self):
