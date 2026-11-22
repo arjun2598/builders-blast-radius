@@ -1,0 +1,7 @@
+{
+ "tests/test_executor.py::TestExecutor::test_execute_tpcds": 0.188,
+ "tests/test_executor.py::TestExecutor::test_execute_tpch": 0.758,
+ "tests/test_executor.py::TestExecutor::test_optimized_tpch": 0.697,
+ "tests/test_generator.py::TestGenerator::test_generator_memory": 0.043,
+ "tests/test_parser.py::TestParser::test_max_nodes": 0.806
+}

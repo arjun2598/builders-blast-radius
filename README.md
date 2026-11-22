@@ -118,7 +118,11 @@ ones against the patched code, and report only those that fail.
      generator finds handlers by method name, so a
      new method changes nothing else;
    - a fixture → tests that opened it; a new data file → tests that list its
-     directory;
+     directory. A change to a `.sql` fixture that only adds, drops or edits
+     `--` comment lines selects nothing: the test helpers read those files
+     only through `_filter_comments`, which drops such lines (checked from
+     the helper's pinned source, and only while no test file opens a `.sql`
+     file any other way);
    - deleted/moved modules, unparseable or unmapped code → every test.
 
    Resolution has a work budget. Past it, the change falls back to users of
@@ -160,13 +164,23 @@ ones against the patched code, and report only those that fail.
      checks that case ends at once and is not counted; each case's check runs
      only with its task. The mapper picks the mode that leaves the
      test passing with no task run;
+   - a slow test with a scaled-down stand-in (`src/blast/proxies.py`) runs
+     the stand-in instead: `test_max_nodes` builds the same statement shapes
+     and makes the same calls and assertions at a hundredth of the size.
+     `tools/proxy_map.py` checks at the pinned commit that the stand-in passes
+     and runs every sqlglot line the real test runs (`data/proxy.json`); only
+     those stand-ins are used, and the cost model prices the test at the
+     stand-in's cost;
    - after a failure the rest of that test file is listed without running
      (failures cluster by file). Other files keep running while their
      estimated CPU is below the simulated time listing them would add, given
      the share of files that failed so far; otherwise everything not run is
      listed. A failed subtest ends its test, and the split executor tests'
      pool tasks run only when their results are read (the optimizer's wait
-     for all of theirs first, so theirs run at once).
+     for all of theirs first, so theirs run at once). A slow test that
+     usually still passes when a sibling in its file fails (a per-test prior
+     from `tools/sibling_prior.py`, `data/sibling.json`) is run anyway when
+     that chance times its listed cost outweighs its CPU.
 5. **Pack**: what gets reported is split across workers to minimise the
    busiest worker's time plus 2 s per worker.
 

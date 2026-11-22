@@ -472,6 +472,37 @@ def select(diffs: list[FileDiff], old: dict, new: dict, m: Map) -> Selection:
     return sel
 
 
+_FILTER_DEF = '''def _filter_comments(s):
+    return "\\n".join([line for line in s.splitlines() if line and not line.startswith("--")])
+'''
+
+
+def _fixture_lines_dropped(fd: FileDiff, old_src, new_src, m: Map) -> bool:
+    """A .sql fixture edit that changes only lines the fixture loaders drop.
+    Holds only while tests/helpers.py (unchanged by the patch) reads every
+    fixture through _filter_comments and no other test code opens .sql files."""
+    path = fd.path
+    if not (path.startswith("tests/fixtures/") and path.endswith(".sql")) or fd.binary \
+            or fd.old_path != fd.new_path or old_src is None or new_src is None:
+        return False
+    if "tests/helpers.py" in (m.patched or {}) or "tests/helpers.py" in m.new_sources:
+        return False
+    helpers = m.sources.get("tests/helpers.py") or ""
+    if _FILTER_DEF not in helpers or helpers.count("open(") != 2 \
+            or helpers.count("_filter_comments(f.read())") != 2:
+        return False
+    others = [f for f, t in m.sources.items() if f.startswith("tests/") and f != "tests/helpers.py"
+              and t and any(".sql" in ln and ("open(" in ln or "read_text" in ln or "read_bytes" in ln)
+                            for ln in t.split("\n"))]
+    if others:
+        return False
+
+    def kept(text):
+        return "\n".join(line for line in text.splitlines() if line and not line.startswith("--"))
+
+    return kept(old_src) == kept(new_src)
+
+
 def _bounded_by_imports(fd: FileDiff, m: Map) -> bool:
     """A changed library module whose only way to matter is being imported:
     an existing .py file under sqlglot/ (not a package __init__, which its
@@ -497,6 +528,13 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
     relevant = path.startswith(("sqlglot/", "tests/", "sqlglotc/")) or path in m.opens
     if not relevant:
         sel.notes.append(f"ignored {path}")
+        return
+
+    if _fixture_lines_dropped(fd, old_src, new_src, m):
+        # the test helpers read .sql fixtures through _filter_comments, which
+        # drops blank lines and lines starting with "--": nothing they return
+        # changed
+        sel.notes.append(f"fixture comments/blank lines only {path}")
         return
 
     # Anything that reads the file, or lists its directory when it appears,

@@ -177,6 +177,8 @@ class SyncExecutor:
         self.shutdown()
 
 
+_run_mods: dict = {}  # test file -> its module, imported by this run
+
 GC_THRESHOLD = tuple(int(x) for x in os.environ.get("BLAST_GC", "50000,50,100").split(","))
 
 
@@ -330,7 +332,8 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
         timeouts: dict[str, float], out_path: str, stop_first: bool = True,
         subsets: dict[str, list[int]] | None = None, duck: str | None = None,
         lazy: set[str] | None = None, costs: dict | None = None, listed: list[int] | None = None,
-        raising: set[str] | None = None, cuts: dict | None = None, cut_target: str | None = None) -> None:
+        raising: set[str] | None = None, cuts: dict | None = None, cut_target: str | None = None,
+        keep: set[str] | None = None, proxied: set[str] | None = None) -> None:
     """subsets: nodeid -> the only pool tasks to run (the map says no other
     task can see the change). duck: recorded DuckDB answers to reuse."""
     os.chdir(workdir)
@@ -404,6 +407,7 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
             gc.disable()
             try:
                 module = importlib.import_module(path[:-3].replace("/", "."))
+                _run_mods[path] = module
             finally:
                 gc.enable()
                 gc.freeze()
@@ -422,6 +426,10 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
                 if cls is None or not hasattr(cls, meth):
                     failed.add(nid)
                     continue
+                if nid in (proxied or ()):
+                    from . import proxies
+
+                    proxies.install(nid, cls)  # its scaled-down stand-in (see blast.proxies)
                 case = cls(meth)
                 ids[id(case)] = nid
                 suite.addTest(case)
@@ -440,6 +448,46 @@ def run(workdir: str, origin: str, changed: list[str], nodeids: list[str],
             if stop_first:
                 break
 
+    # Slow tests that often pass even when another test of their file fails
+    # (keep, from main): a stop listed them unrun, but running them is likely
+    # to save more listed time than it costs. Run them now, without stopping.
+    left = [nid for nid in nodeids if nid in (keep or ()) and nid not in result.done
+            and nid not in failed and nid.count("::") == 2]
+    if left:
+        r2 = Result(ids, timeouts, False, subsets, lazy, raising, cuts if cut_target else None)
+        suite = unittest.TestSuite()
+        for nid in left:
+            path, cls_name, meth = nid.split("::")
+            if path not in _run_mods:
+                try:
+                    gc.disable()
+                    try:
+                        _run_mods[path] = importlib.import_module(path[:-3].replace("/", "."))
+                    finally:
+                        gc.enable()
+                        gc.freeze()
+                except BaseException as e:  # noqa: BLE001
+                    print(f"import failed {path}: {e!r}", file=sys.stderr)
+                    failed.add(nid)
+                    continue
+            cls = getattr(_run_mods[path], cls_name, None)
+            if cls is None or not hasattr(cls, meth):
+                continue
+            if nid in (proxied or ()):
+                from . import proxies
+
+                proxies.install(nid, cls)
+            case = cls(meth)
+            ids[id(case)] = nid
+            suite.addTest(case)
+        try:
+            suite.run(r2)
+        except BaseException as e:  # noqa: BLE001
+            print(f"kept tests crashed: {e!r}", file=sys.stderr)
+        result.bad |= r2.bad
+        result.done |= r2.done
+        if r2.class_errors:
+            failed.update(left)
     failed |= result.bad
     # not run (stopped early, fixture error, crash): report them all
     failed |= {nid for nid in nodeids if nid not in result.done}

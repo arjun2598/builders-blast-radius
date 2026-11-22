@@ -34,6 +34,8 @@ CMP = Path(os.environ.get("BLAST_CMPMAP", "/app/data/cmp"))
 KEYS = Path(os.environ.get("BLAST_KEYMAP", "/app/data/keys"))
 BOOL = Path(os.environ.get("BLAST_BOOLMAP", "/app/data/bool"))
 REQ = Path(os.environ.get("BLAST_REQMAP", "/app/data/req.json.gz"))
+SIBLING = Path(os.environ.get("BLAST_SIBLING", "/app/data/sibling.json"))
+PROXY = Path(os.environ.get("BLAST_PROXY", "/app/data/proxy.json"))
 NEEDS = Path(os.environ.get("BLAST_NEEDS", "/app/data/imports.json.gz"))
 POPEN = Path(os.environ.get("BLAST_POPEN", "/app/data/popen.json"))
 PREBUILT = Path(os.environ.get("BLAST_PREBUILT", "/app/prebuilt.pkl"))
@@ -438,8 +440,11 @@ class CostModel:
         self.cuts: dict[int, dict] = {}  # of the commit being costed
         self.cut_cpu: dict[int, list[float]] = {}  # test -> CPU of each pool task's stage cut
         self.use_duck = False
+        self.proxy: dict[int, float] = {}  # tests run as their stand-in (blast.proxies) -> CPU
 
     def test_cpu(self, t: int) -> float:
+        if t in self.proxy:
+            return self.proxy[t]
         if t in self.cuts and t in self.sub and t in self.cut_cpu:
             fixed, per = self.sub[t]
             cut, cc = self.cuts[t], self.cut_cpu[t]
@@ -572,7 +577,17 @@ def main() -> None:
     peak_mb = [0.0]
     last_ru = [0.0]
     cm = CostModel(tests, CPU_TABLE)
+    try:  # slow test -> chance it passes when another test of its file fails
+        prior = {by_id[k]: v for k, v in json.loads(SIBLING.read_text()).items() if k in by_id}
+    except Exception as e:  # noqa: BLE001
+        log("no sibling prior:", repr(e))
+        prior = {}
     cm.cut_cpu = stage_cpu
+    try:  # stand-ins checked against their tests at the pinned commit (tools/proxy_map.py)
+        cm.proxy = {by_id[k]: v["cpu"] * CPU_SCALE + 0.05 for k, v in json.loads(PROXY.read_text()).items()
+                    if k in by_id}
+    except Exception as e:  # noqa: BLE001
+        log("no proxies:", repr(e))
     for c in commits:
         prepare(c, m, tests, cm)
 
@@ -657,6 +672,10 @@ def main() -> None:
                                raising={ids[t] for t in m.subtask_raise if t in ids},
                                cuts={ids[t]: (v, len(v) >= CUT_GIVE_UP) for t, v in c.cuts.items()},
                                cut_target=m.stage_target,
+                               # worth running after their file had a failure
+                               proxied={ids[t] for t in c.run if t in cm.proxy},
+                               keep={ids[t] for t in c.run if t in prior
+                                     and prior[t] * ms[t] / 1000 > cm.test_cpu(t) + 0.3},
                                costs={ids[t]: (cm.test_cpu(t), ms[t]) for t in c.run},
                                listed=[ms[t] for t in c.report])
                 except BaseException as e:  # noqa: BLE001
