@@ -28,6 +28,7 @@ MAP = Path(os.environ.get("BLAST_MAP", "/app/data/map.json.gz"))
 PYC = os.environ.get("BLAST_PYC", "/opt/pyc")
 TMP = Path(os.environ.get("BLAST_TMP", "/tmp"))
 SLOTS = int(os.environ.get("BLAST_SLOTS", "2"))
+PARTIAL_MARGIN = float(os.environ.get("BLAST_PARTIAL_MARGIN", "3.0"))  # s a partial run must save
 PAR_AFTER = float(os.environ.get("BLAST_PAR_AFTER", "30"))  # s: past this, run SLOTS children at once
 CPU_TABLE = Path(os.environ.get("BLAST_CPU", "/app/data/cpu.json"))
 DUCK = Path(os.environ.get("BLAST_DUCK", "/app/data/duck.pkl.gz"))
@@ -39,6 +40,7 @@ SIBLING = Path(os.environ.get("BLAST_SIBLING", "/app/data/sibling.json"))
 PROXY = Path(os.environ.get("BLAST_PROXY", "/app/data/proxy.json"))
 NEEDS = Path(os.environ.get("BLAST_NEEDS", "/app/data/imports.json.gz"))
 POPEN = Path(os.environ.get("BLAST_POPEN", "/app/data/popen.json"))
+PAIRS = Path(os.environ.get("BLAST_PAIRS", "/app/data/pairs.json"))
 XCACHE = Path(os.environ.get("BLAST_XCACHE", "/app/xcache.pkl"))
 POPEN_LINES = Path(os.environ.get("BLAST_POPEN_LINES", "/app/data/popen_lines.json"))
 PREBUILT = Path(os.environ.get("BLAST_PREBUILT", "/app/prebuilt.pkl"))
@@ -186,7 +188,8 @@ def prepare(c: Commit, m: candidates.Map, all_tests: list[dict], cm: "CostModel"
             cands.add(p)
         changed = list(c.new_files)
         c.duck = all(f.endswith(".py") for f in changed)
-        if not sel.everything and all(f.startswith("sqlglot/") and f.endswith(".py") for f in changed):
+        if not sel.everything and all((f.startswith("sqlglot/") and f.endswith(".py")) or f in sel.pair_files
+                                      for f in changed):
             for p, idx in tasks.items():
                 if p in m.subtasks and len(idx) < m.subtasks[p]:
                     c.subsets[p] = sorted(idx)
@@ -502,10 +505,24 @@ class CostModel:
         list_all = self.pack_cost(cands)
         expect_fail = (P_FAIL * (WORKER_COST_MS / 1000 + 0.2)) if not slow else 0.3
         run_rest = self.run_cpu(rest, purge) + self.pack_cost(slow) + expect_fail
-        if not rest or list_all <= run_rest:
+        best = (list_all, 0) if list_all <= run_rest else (run_rest, len(rest))
+        # or run only the tests cheapest per listed second they would save,
+        # and list the rest
+        by_gain = sorted(rest, key=lambda t: (self.test_cpu(t) / max(self.ms[t], 1), t))
+        n = len(by_gain)
+        for k in sorted({1, 2, 3, 5, 8, 12, 20, 30, 50, 80, 120, 200} | {n * f // 10 for f in range(1, 10)}):
+            if 0 < k < n:
+                # (only when clearly cheaper: CPU estimates of large runs
+                # are rough, and the scorer's CPU seconds cost more)
+                cost = (self.run_cpu(by_gain[:k], purge) + self.pack_cost(slow | set(by_gain[k:]))
+                        + P_FAIL * (WORKER_COST_MS / 1000 + 0.2) + PARTIAL_MARGIN)
+                if cost < best[0]:
+                    best = (cost, k)
+        if not rest or best[1] == 0:
             return set(cands), []
-        order = sorted(rest, key=lambda t: (self.test_cpu(t), t))
-        return slow, order
+        run = by_gain[:best[1]]
+        order = sorted(run, key=lambda t: (self.test_cpu(t), t))
+        return cands - set(run), order
 
     def approx_pack(self, tests) -> float:
         """pack_cost without packing: the largest of the biggest test and an
@@ -571,6 +588,7 @@ def main() -> None:
     m.load_needs(str(NEEDS))
     m.load_popen(str(POPEN))
     m.load_popen_lines(str(POPEN_LINES))
+    m.load_pairs(str(PAIRS))
     m.load_disp(str(DISP))
     m.stage, m.stage_target, stage_cpu = load_stage(STAGE, by_id) if str(STAGE) not in ("", ".") else ({}, None, {})
     for f in list(REPO.glob("sqlglot/**/*.py")) + list(REPO.glob("tests/**/*.py")):

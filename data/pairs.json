@@ -1,0 +1,304 @@
+{
+"tests/test_executor.py::TestExecutor::test_agg_order": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_aggregate_without_group_by": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_array_slice": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_case_sensitivity": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_correlated_count": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_correlated_exists_over_a_nested_scalar_aggregate": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_correlated_exists_over_scalar_aggregate": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_correlated_not_in_is_not_unnested": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_correlated_not_in_not_join_key_is_not_unnested": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_count_distinct": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_count_distinct_multiple_columns": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_distinct_group_by_order_by_aggregate": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_distinct_order_by": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_distinct_order_by_aliased_projection": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_distinct_order_by_column_from_different_table": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_distinct_order_by_column_outside_select_list": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_distinct_order_by_computed_expression": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_distinct_order_by_unaliased_projection": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_dpipe": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_dpipe_source_dialect_coercion": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_execute_callable": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_execute_catalog_db_table": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_execute_subqueries": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_execute_tables": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_execute_tpcds": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "tasks",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_execute_tpch": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "tasks"
+},
+"tests/test_executor.py::TestExecutor::test_first": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_group_by": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_ilike_semantics": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_in_any_subquery_without_a_from": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_integer_division_floating_point": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_integer_division_truncates_towards_zero": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_length": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_like_semantics": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_negated_like": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_nested_table_reference": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_nested_values": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_null_ordering_honors_nulls_first_and_dialect_defaults": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_offset_no_order_by": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_offset_order_by": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_operators_apply_to_a_whole_case_expression": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_optimized_tpch": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_outer_joins_preserve_unmatched_rows": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_py_dialect": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_scalar_functions": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_set_operation_order_by": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_set_operations": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_sql_boolean_logic_preserves_short_circuiting": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_sql_boolean_logic_with_numpy_scalars": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_sql_three_valued_boolean_logic": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_static_queries": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_subqueries": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_subquery_cardinality": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_subquery_execution_does_not_mutate_the_plan": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_subquery_memoization": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_table_depth_mismatch": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_table_to_pylist": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_tables": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_typed_division": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_executor.py::TestExecutor::test_typed_division_of_null_is_null": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "none",
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "none"
+},
+"tests/test_optimizer.py::TestOptimizer::test_canonicalize": {
+"tests/fixtures/optimizer/canonicalize.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_canonicalize_internal_names": {
+"tests/fixtures/optimizer/canonicalize_internal_names.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_eliminate_ctes": {
+"tests/fixtures/optimizer/eliminate_ctes.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_eliminate_joins": {
+"tests/fixtures/optimizer/eliminate_joins.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_eliminate_subqueries": {
+"tests/fixtures/optimizer/eliminate_subqueries.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_isolate_table_selects": {
+"tests/fixtures/optimizer/isolate_table_selects.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_merge_subqueries": {
+"tests/fixtures/optimizer/merge_subqueries.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_normalize": {
+"tests/fixtures/optimizer/normalize.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_normalize_identifiers": {
+"tests/fixtures/optimizer/normalize_identifiers.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_optimize": {
+"tests/fixtures/optimizer/optimizer.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_optimize_joins": {
+"tests/fixtures/optimizer/optimize_joins.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_pushdown_cte_alias_columns": {
+"tests/fixtures/optimizer/pushdown_cte_alias_columns.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_pushdown_predicates": {
+"tests/fixtures/optimizer/pushdown_predicates.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_pushdown_projection": {
+"tests/fixtures/optimizer/pushdown_projections.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_qualify_columns__with_invisible": {
+"tests/fixtures/optimizer/qualify_columns__with_invisible.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_qualify_tables": {
+"tests/fixtures/optimizer/qualify_tables.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_quote_identifiers": {
+"tests/fixtures/optimizer/quote_identifiers.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_simplify": {
+"tests/fixtures/optimizer/simplify.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_tpcds": {
+"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_tpch": {
+"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "tasks"
+},
+"tests/test_optimizer.py::TestOptimizer::test_unnest_subqueries": {
+"tests/fixtures/optimizer/unnest_subqueries.sql": "tasks"
+}
+}

@@ -24,6 +24,7 @@ class Selection:
     everything: bool = False  # can't reason about it: every test is a candidate
     notes: list[str] = field(default_factory=list)
     import_probe: dict = field(default_factory=dict)  # path -> function lines run at import time
+    pair_files: set = field(default_factory=set)  # fixtures narrowed to the pool tasks of changed pairs
 
 
 def load_map(path: str, cache: str | None = None) -> dict:
@@ -246,6 +247,21 @@ class Map:
             if got is None or not got <= safe:
                 return False
         return True
+
+    def load_pairs(self, path: str) -> None:
+        """data/pairs.json: test id -> {fixture: "none" | "tasks"}."""
+        try:
+            with open(path) as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            return
+        by_id = {t["id"]: t["number"] for t in self.tests}
+        kinds: dict = {}
+        for nid, files in d.items():
+            if nid in by_id:
+                for f, k in files.items():
+                    kinds.setdefault(f, {})[by_id[nid]] = k
+        self.pair_kinds = kinds
 
     def load_needs(self, path: str) -> None:
         try:
@@ -549,6 +565,7 @@ def select(diffs: list[FileDiff], old: dict, new: dict, m: Map) -> Selection:
         sel.notes += sub.notes
         for k, v in sub.import_probe.items():
             sel.import_probe.setdefault(k, set()).update(v)
+        sel.pair_files |= sub.pair_files
         if sub.everything:
             sel.everything = True
             break
@@ -586,6 +603,68 @@ def _fixture_lines_dropped(fd: FileDiff, old_src, new_src, m: Map) -> bool:
     return kept(old_src) == kept(new_src)
 
 
+_PAIR_FUNCS = ("_filter_comments", "_extract_meta", "load_sql_fixture_pairs")
+
+
+def _pinned_pairs(helpers_src: str, text: str):
+    """The (meta, sql, expected) pairs the pinned tests/helpers.py loader
+    yields for text: its own three functions, run on the text."""
+    import ast
+    import io
+
+    tree = ast.parse(helpers_src)
+    defs = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in _PAIR_FUNCS]
+    if sorted(d.name for d in defs) != sorted(_PAIR_FUNCS):
+        raise ValueError("loader not found")
+    ns = {"os": os, "FIXTURES_DIR": "", "open": lambda *a, **k: io.StringIO(text)}
+    exec(compile(ast.Module(body=defs, type_ignores=[]), "tests/helpers.py", "exec"), ns)  # noqa: S102
+    return list(ns["load_sql_fixture_pairs"]("x"))
+
+
+def _fixture_pairs_narrowed(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> bool:
+    """A .sql fixture edit that keeps the file's pair count, while the test
+    code is as at the pinned commit. data/pairs.json (tools/pair_map.py)
+    says, per test that opened the file: "none" (it never read a pair, only
+    its class setup loaded them) or "tasks" (one pool task per pair, task k
+    for pair k). Such a test can see only the changed pairs, through their
+    tasks. Tests not in the map, and every other reader, are kept whole."""
+    path = fd.path
+    kinds = getattr(m, "pair_kinds", {}).get(path)
+    if not kinds or not (path.startswith("tests/fixtures/") and path.endswith(".sql")) or fd.binary \
+            or fd.old_path != fd.new_path or old_src is None or new_src is None or fd.old_mode != fd.new_mode:
+        return False
+    if any(f.endswith(".py") and not f.startswith("sqlglot/") for f in m.new_sources):
+        return False  # the map was made with the pinned test code
+    helpers = m.sources.get("tests/helpers.py")
+    if not helpers:
+        return False
+    try:
+        old_p, new_p = _pinned_pairs(helpers, old_src), _pinned_pairs(helpers, new_src)
+    except Exception:  # noqa: BLE001  (a class setup that loads it would fail too)
+        return False
+    if len(old_p) != len(new_p):
+        return False
+    changed = {i for i, (a, b) in enumerate(zip(old_p, new_p)) if a != b}
+    out: set[int] = set()
+    for t in m.opens.get(path, ()):
+        parent = (t - 10_000_000) // 1000 if t >= 10_000_000 else t
+        kind = kinds.get(parent)
+        if kind == "none":
+            continue
+        if kind == "tasks":
+            if t >= 10_000_000:
+                if t % 1000 in changed:
+                    out.add(t)
+            else:
+                out |= {10_000_000 + t * 1000 + i for i in changed}
+            continue
+        out.add(t)
+    sel.tests |= out
+    sel.pair_files.add(path)
+    sel.notes.append(f"fixture pairs {sorted(changed)[:10]} of {len(old_p)} changed in {path}: {len(out)} candidates")
+    return True
+
+
 def _bounded_by_imports(fd: FileDiff, m: Map) -> bool:
     """A changed library module whose only way to matter is being imported:
     an existing .py file under sqlglot/ (not a package __init__, which its
@@ -611,6 +690,9 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
     relevant = path.startswith(("sqlglot/", "tests/", "sqlglotc/")) or path in m.opens
     if not relevant:
         sel.notes.append(f"ignored {path}")
+        return
+
+    if _fixture_pairs_narrowed(fd, old_src, new_src, m, sel):
         return
 
     if _fixture_lines_dropped(fd, old_src, new_src, m):

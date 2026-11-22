@@ -125,7 +125,15 @@ ones against the patched code, and report only those that fail.
      `--` comment lines selects nothing: the test helpers read those files
      only through `_filter_comments`, which drops such lines (checked from
      the helper's pinned source, and only while no test file opens a `.sql`
-     file any other way);
+     file any other way). An edit to a `.sql` fixture that keeps its number
+     of pairs (as the pinned helpers' own loader splits the old and new text)
+     reaches, of the tests that opened it, only those that read a changed
+     pair. `tools/pair_map.py` runs each such test with the loader's pairs
+     tagged and records, per fixture, tests that never read a pair (their
+     class setup loaded the file for other tests) and tests that submit one
+     pool task per pair, task k for pair k. The first are dropped, the second
+     run only the tasks of changed pairs (`data/pairs.json`); every other
+     reader runs whole. Only while the test code is the pinned code;
    - deleted/moved modules, unparseable or unmapped code → every test.
 
    Resolution has a work budget. Past it, the change falls back to users of
@@ -145,7 +153,9 @@ ones against the patched code, and report only those that fail.
    imports inside functions).
 3. **Run or list** (`src/blast/main.py`). From measured CPU costs
    (`data/cpu.json`), each commit either lists its candidates without running
-   them or runs them. Very slow tests are always listed without running.
+   them or runs them, or runs only the tests cheapest per listed second they
+   would save when that is clearly cheaper than both. Very slow tests are
+   always listed without running.
 4. **Run** (`src/blast/runner.py`). A forked child runs the tests through
    unittest on a patched copy of sqlglot in `/tmp`:
    - the parent preloads pytest-free dependencies and sqlglot core, so a child
@@ -301,6 +311,13 @@ The generator dispatch map:
 cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=../../tools:../../src MAP_LINES=0 MAP_ATTRS=0 MAP_DISPATCH=1 \
   ../venv/bin/python ../../tools/mapper_fork.py ../../blast-radius-sample/sample/tests.json ../rawdisp 7
 cd ../.. && python3 tools/build_disp.py work/rawdisp blast-radius-sample/sample/tests.json data/disp.json.gz
+```
+
+The fixture pair map:
+
+```sh
+cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=../../src ../venv/bin/python \
+  ../../tools/pair_map.py ../../data/map.json.gz ../../blast-radius-sample/sample/tests.json ../../data/pairs.json 6
 ```
 
 The subprocess module map:

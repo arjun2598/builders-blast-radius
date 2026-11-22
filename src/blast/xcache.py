@@ -58,7 +58,8 @@ def usable(changed) -> bool:
     """The patch touches none of the setup's inputs, and adds no top-level
     module (it could shadow csv, ast or gzip)."""
     for f in changed:
-        if f in INPUTS or f.startswith(DATA_DIRS) or "/" not in f:
+        if f in INPUTS or (f.startswith(DATA_DIRS) and not f.endswith(".sql")) or "/" not in f:
+            # (the .sql query files there are loaded fresh, as the real setup does)
             return False
         if not f.startswith(("sqlglot/", "tests/")):
             return False
