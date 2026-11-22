@@ -215,6 +215,38 @@ class Map:
                 out.add(t)
         return out
 
+    def load_popen_lines(self, path: str) -> None:
+        try:
+            with open(path) as fh:
+                self.popen_lines = {int(k): {f: set(v) for f, v in d.items()} for k, d in json.load(fh).items()}
+        except (OSError, ValueError):
+            self.popen_lines = {}
+
+    def popen_untouched(self, t: int, diffs: list["FileDiff"], old: dict, new: dict) -> bool:
+        """True when every change sits in bodies of functions that test t's
+        subprocesses never ran at the pinned commit (data/popen_lines.json).
+        A function that is never called runs none of its body, so such a
+        change can't reach them. Headers, decorators, defaults, docstrings and
+        anything outside a function run when the def does, so they count."""
+        lines = getattr(self, "popen_lines", {}).get(t)
+        if lines is None:
+            return False
+        for fd in diffs:
+            if (fd.old_path != fd.new_path or not fd.path.startswith("sqlglot/") or not fd.path.endswith(".py")
+                    or not old.get(fd.path) or not new.get(fd.path) or fd.binary):
+                return False
+            safe = _unrun_bodies(old[fd.path], fd.changed_old_lines(), lines.get(fd.path, set()))
+            if safe is None:
+                return False
+            added = fd.changed_new_lines()
+            new_lines = new[fd.path].splitlines()
+            if any(n > len(new_lines) or new_lines[n - 1].rstrip("\r") != text for n, text in added.items()):
+                return False
+            got = _unrun_bodies(new[fd.path], set(added), None)
+            if got is None or not got <= safe:
+                return False
+        return True
+
     def load_needs(self, path: str) -> None:
         try:
             with gzip.open(path, "rt") as fh:
@@ -442,6 +474,50 @@ def _strip_docless(src: str) -> str | None:
         return None
 
 
+def _unrun_bodies(src: str, changed: set[int], ran: set[int] | None) -> set[str] | None:
+    """Qualified names of the innermost functions whose bodies hold every
+    changed line, or None if a line is outside every body. With ran (lines
+    that ran), also None if any def of such a name ran a body line."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    defs: list[tuple[str, int, int, int]] = []  # qualname, body start, end, def start
+
+    def walk(node, prefix):
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                q = prefix + ch.name
+                body = ch.body
+                first = body[0]
+                start = first.lineno
+                if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                        and isinstance(first.value.value, str)):
+                    start = first.end_lineno + 1  # the docstring is stored when the def runs
+                defs.append((q, start, ch.end_lineno or ch.lineno, ch.lineno))
+                walk(ch, q + ".<locals>.")
+            elif isinstance(ch, ast.ClassDef):
+                walk(ch, prefix + ch.name + ".")
+            else:
+                walk(ch, prefix)
+
+    walk(tree, "")
+    out = set()
+    for ln in changed:
+        inner = None
+        for d in defs:
+            if d[3] <= ln <= d[2] and (inner is None or d[3] >= inner[3]):
+                inner = d
+        if inner is None or not inner[1] <= ln <= inner[2]:
+            return None
+        out.add(inner[0])
+    if ran is not None:
+        for q, start, end, _ in defs:
+            if q in out and any(start <= l <= end for l in ran):
+                return None
+    return out
+
+
 def select(diffs: list[FileDiff], old: dict, new: dict, m: Map) -> Selection:
     """old/new map path -> text (None if missing)."""
     m.patched = new
@@ -452,6 +528,13 @@ def select(diffs: list[FileDiff], old: dict, new: dict, m: Map) -> Selection:
             m.new_sources[p] = None
     m._graph = None
     m.popen = m.popen_for(list(m.new_sources))
+    for t in sorted(m.popen):
+        try:
+            if m.popen_untouched(t, diffs, old, new):
+                m.popen.discard(t)
+                sel.notes.append(f"subprocesses of {t} never ran the changed bodies")
+        except Exception:  # noqa: BLE001
+            pass
     for fd in diffs:
         sub = Selection()
         _select_file(fd, old.get(fd.old_path) if fd.old_path else None,

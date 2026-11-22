@@ -56,7 +56,10 @@ ones against the patched code, and report only those that fail.
    - a test that starts Python subprocesses (`test_lazy_load`) → only when
      the patch touches a module those subprocesses loaded at the pinned
      commit (`data/popen.json`, from `tools/mapper_popen.py`), or anything
-     but sqlglot code;
+     but sqlglot code. The same pass records the lines those subprocesses
+     ran (`data/popen_lines.json`); a change that sits only inside bodies of
+     functions they never ran (not headers, defaults, docstrings or module
+     code) can't reach them either;
    - comment/format-only edits (identical AST) → nothing, beyond tests that
      read the file or look at code objects (bytecode is unchanged, only line
      numbers move); an encoding-line change counts as code;
@@ -182,7 +185,8 @@ ones against the patched code, and report only those that fail.
      from `tools/sibling_prior.py`, `data/sibling.json`) is run anyway when
      that chance times its listed cost outweighs its CPU.
 5. **Pack**: what gets reported is split across workers to minimise the
-   busiest worker's time plus 2 s per worker.
+   busiest worker's time plus 2 s per worker. Once every line is written and every
+   child reaped, the process exits without the interpreter's teardown.
 
 Any error falls back to listing all candidates, so a crash costs time, never
 a miss. A child whose resident memory passes 1.4 GB is killed the same way,
@@ -288,7 +292,7 @@ The subprocess module map:
 
 ```sh
 cd work/sqlglot && PATH=$PWD/../venv/bin:$PATH PYTHONPATH=../../src ../venv/bin/python \
-  ../../tools/mapper_popen.py ../../data/map.json.gz ../../blast-radius-sample/sample/tests.json ../../data/popen.json
+  ../../tools/mapper_popen.py ../../data/map.json.gz ../../blast-radius-sample/sample/tests.json ../../data/popen.json ../../data/popen_lines.json
 ```
 
 For native runs, build the prebuilt data once (again after rebuilding the map):

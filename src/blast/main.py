@@ -38,6 +38,7 @@ SIBLING = Path(os.environ.get("BLAST_SIBLING", "/app/data/sibling.json"))
 PROXY = Path(os.environ.get("BLAST_PROXY", "/app/data/proxy.json"))
 NEEDS = Path(os.environ.get("BLAST_NEEDS", "/app/data/imports.json.gz"))
 POPEN = Path(os.environ.get("BLAST_POPEN", "/app/data/popen.json"))
+POPEN_LINES = Path(os.environ.get("BLAST_POPEN_LINES", "/app/data/popen_lines.json"))
 PREBUILT = Path(os.environ.get("BLAST_PREBUILT", "/app/prebuilt.pkl"))
 DISP = Path(os.environ.get("BLAST_DISP", "/app/data/disp.json.gz"))
 # off unless set: on the practice board the cut made tests run that failed
@@ -196,6 +197,8 @@ def prepare(c: Commit, m: candidates.Map, all_tests: list[dict], cm: "CostModel"
         c.report = set(cands)
         return
     c.report, c.run = cm.decide(cands, c.new_files, c.subsets, c.duck, c.cuts)
+    if 0 < len(c.run) <= 3:
+        log(c.id, "runs:", " ".join(cm.id[t] for t in c.run))
     for t in list(c.subsets):
         if t not in c.run:
             del c.subsets[t]
@@ -551,6 +554,7 @@ def main() -> None:
         m.req = cmpcheck.ReqMap(str(REQ))
     m.load_needs(str(NEEDS))
     m.load_popen(str(POPEN))
+    m.load_popen_lines(str(POPEN_LINES))
     m.load_disp(str(DISP))
     m.stage, m.stage_target, stage_cpu = load_stage(STAGE, by_id) if str(STAGE) not in ("", ".") else ({}, None, {})
     for f in list(REPO.glob("sqlglot/**/*.py")) + list(REPO.glob("tests/**/*.py")):
@@ -727,3 +731,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    # Every line is written and every child reaped: skip the interpreter's
+    # teardown (freeing every module and object costs CPU, changes nothing).
+    for f in (sys.stdout, sys.stderr):
+        try:
+            f.flush()
+        except Exception:  # noqa: BLE001
+            pass
+    os._exit(0)

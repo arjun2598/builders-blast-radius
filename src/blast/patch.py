@@ -47,6 +47,30 @@ class FileDiff:
         return out
 
 
+    def changed_new_lines(self) -> dict[int, str]:
+        """New-file line number -> text of each line the diff adds, taking
+        each hunk to apply at its stated old line (callers check the text)."""
+        out: dict[int, str] = {}
+        delta = 0
+        for h in self.hunks:
+            old = h.old_start if h.old_start else 1
+            new = old + delta
+            if not h.old_start:
+                new = 1 + delta
+            for line in h.lines:
+                tag = line[:1]
+                if tag == " ":
+                    old += 1
+                    new += 1
+                elif tag == "-":
+                    old += 1
+                elif tag == "+":
+                    out[new] = line[1:].rstrip("\r\n")
+                    new += 1
+            delta = new - old
+        return out
+
+
 def _strip(path: str) -> str | None:
     path = path.split("\t")[0].strip()
     if path == "/dev/null":
