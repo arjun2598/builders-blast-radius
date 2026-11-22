@@ -569,6 +569,7 @@ def main() -> None:
     ids = {t["number"]: t["id"] for t in tests}
     by_id = {t["id"]: t["number"] for t in tests}
     m = candidates.Map(str(MAP), tests, cache=str(PREBUILT.with_name("map.pkl")))
+    m.repo = str(REPO)
     if CMP.is_dir():
         from . import cmpcheck
 

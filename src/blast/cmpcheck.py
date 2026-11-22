@@ -30,6 +30,7 @@ class Edit:
         self.op_old = type(old.ops[0]).__name__
         self.op_new = type(new.ops[0]).__name__
         # a side whose source changed must be a literal on both versions
+        self.type_eq: set = set()  # object types == compares by type first (see type_guarded)
         self.left = self._side(old.left, new.left)
         self.right = self._side(old.comparators[0], new.comparators[0])
 
@@ -146,7 +147,12 @@ def changes(e: Edit, o) -> bool:
             same_enum = (lobj and robj and not e.left and not e.right and len(lk) > 3 and len(rk) > 3
                          and lk[3] and rk[3] and lk[1] == rk[1])
             if not same_enum and not all(_ideq(k) for k in objs):
-                return True
+                lit = rv if lobj else lv
+                if not (len(objs) == 1 and objs[0][1] in e.type_eq and _builtin_literal(lit)):
+                    return True
+                # a type whose == is False for any value of another type
+                r = new == "NotEq"
+                return type(r) is not bool or r != res
             ident = False if (e.left or e.right) else bool(same)
             r = ident if new == "Eq" else not ident
         elif new in ("In", "NotIn") and lobj and not robj and _ideq(lk) and isinstance(rv, (tuple, frozenset, set, list)) \
@@ -199,6 +205,154 @@ def narrow(e: Edit, path: str, cm: CmpMap):
         if any(flips[i] for i in idx):
             hit.update(tests)
     return hit, set(cm.mapped) - hit
+
+
+def _builtin_literal(v) -> bool:
+    if v is UNKNOWN:
+        return False
+    if isinstance(v, tuple):
+        return all(_builtin_literal(x) for x in v)
+    return v is None or type(v) in (bool, int, float, complex, str, bytes)
+
+
+def site_types(e: Edit, path: str, cm: "CmpMap") -> set:
+    """Names of the object types (those == isn't plain identity for) seen
+    at the edited site."""
+    data = cm.file(path)
+    site = data.get(f"{path}:{e.site[0]}:{e.site[1]}") if data else None
+    if not site:
+        return set()
+    return {k[1] for o in site["o"] for k in (o[0], o[1]) if k[0] == "t" and not k[2]}
+
+
+def _args(fn: ast.FunctionDef):
+    a = fn.args
+    if a.posonlyargs or a.vararg or a.kwarg or a.kwonlyargs or len(a.args) != 2:
+        return None
+    return a.args[0].arg, a.args[1].arg
+
+
+def _is_name(n, name) -> bool:
+    return isinstance(n, ast.Name) and n.id == name
+
+
+def _type_of(n, name) -> bool:
+    return (isinstance(n, ast.Call) and _is_name(n.func, "type") and len(n.args) == 1
+            and not n.keywords and _is_name(n.args[0], name))
+
+
+def _type_check(n, a0, a1) -> bool:
+    """type(self) is type(other), either way round."""
+    return (isinstance(n, ast.Compare) and len(n.ops) == 1 and isinstance(n.ops[0], ast.Is)
+            and ((_type_of(n.left, a0) and _type_of(n.comparators[0], a1))
+                 or (_type_of(n.left, a1) and _type_of(n.comparators[0], a0))))
+
+
+def _body(fn):
+    b = fn.body
+    if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant):
+        b = b[1:]
+    return b
+
+
+def _eq_by_type(fn: ast.FunctionDef) -> bool:
+    """return [self is other or] (type(self) is type(other) [and ...])"""
+    names = _args(fn)
+    body = _body(fn)
+    if names is None or len(body) != 1 or not isinstance(body[0], ast.Return) or body[0].value is None:
+        return False
+    a0, a1 = names
+    v = body[0].value
+    if isinstance(v, ast.BoolOp) and isinstance(v.op, ast.Or):
+        if len(v.values) != 2:
+            return False
+        first, v = v.values
+        if not (isinstance(first, ast.Compare) and len(first.ops) == 1 and isinstance(first.ops[0], ast.Is)
+                and {getattr(first.left, "id", None), getattr(first.comparators[0], "id", None)} == {a0, a1}
+                and isinstance(first.left, ast.Name) and isinstance(first.comparators[0], ast.Name)):
+            return False
+    if isinstance(v, ast.BoolOp) and isinstance(v.op, ast.And):
+        v = v.values[0]
+    return _type_check(v, a0, a1)
+
+
+def _ne_by_eq(fn: ast.FunctionDef) -> bool:
+    """return not self.__eq__(other)"""
+    names = _args(fn)
+    body = _body(fn)
+    if names is None or len(body) != 1 or not isinstance(body[0], ast.Return):
+        return False
+    v = body[0].value
+    return (isinstance(v, ast.UnaryOp) and isinstance(v.op, ast.Not) and isinstance(v.operand, ast.Call)
+            and isinstance(v.operand.func, ast.Attribute) and v.operand.func.attr == "__eq__"
+            and _is_name(v.operand.func.value, names[0]) and len(v.operand.args) == 1
+            and _is_name(v.operand.args[0], names[1]) and not v.operand.keywords)
+
+
+def type_guarded(names, repo: str, edit_path: str, edit_line: int) -> set:
+    """The names (module.qualname) of pinned sqlglot classes whose == is
+    False, and != True, for any operand of another type: __eq__ starts by
+    checking type(self) is type(other) (after an optional identity check),
+    and __ne__ is the default or its negation. The edit must not be inside
+    either method."""
+    import importlib
+    import inspect
+    import sys
+    import textwrap
+
+    root = os.path.realpath(repo)
+    if root not in [os.path.realpath(p) for p in sys.path if p]:
+        sys.path.insert(0, root)
+    out: set = set()
+    seen: dict = {}
+    for name in names:
+        if not name.startswith("sqlglot."):
+            continue
+        parts = name.split(".")
+        cls = None
+        for i in range(len(parts) - 1, 0, -1):
+            try:
+                obj = importlib.import_module(".".join(parts[:i]))
+            except Exception:  # noqa: BLE001
+                continue
+            for p in parts[i:]:
+                obj = getattr(obj, p, None)
+            cls = obj
+            break
+        if not isinstance(cls, type):
+            continue
+        key = (cls.__eq__, cls.__ne__)
+        if key not in seen:
+            seen[key] = _guarded(cls, root, edit_path, edit_line, inspect, textwrap)
+        if seen[key]:
+            out.add(name)
+    return out
+
+
+def _guarded(cls, root, edit_path, edit_line, inspect, textwrap) -> bool:
+    eq, ne = cls.__eq__, cls.__ne__
+    fns = [(eq, _eq_by_type)]
+    if ne is not object.__ne__:
+        fns.append((ne, _ne_by_eq))
+    for f, check in fns:
+        if not inspect.isfunction(f):
+            return False
+        code = f.__code__
+        fname = os.path.realpath(code.co_filename)
+        if not fname.startswith(root + os.sep):
+            return False
+        try:
+            lines, start = inspect.getsourcelines(f)
+            tree = ast.parse(textwrap.dedent("".join(lines)))
+        except (OSError, TypeError, SyntaxError):
+            return False
+        fn = tree.body[0] if tree.body else None
+        if not isinstance(fn, ast.FunctionDef) or fn.decorator_list or not check(fn):
+            return False
+        rel = fname[len(root) + 1:].replace(os.sep, "/")
+        if rel == edit_path and start <= edit_line < start + len(lines):
+            return False
+    return True
 
 
 # ---- dictionary entries ---------------------------------------------------

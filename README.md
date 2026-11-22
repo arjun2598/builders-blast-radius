@@ -63,6 +63,10 @@ ones against the patched code, and report only those that fail.
    - comment/format-only edits (identical AST) → nothing, beyond tests that
      read the file or look at code objects (bytecode is unchanged, only line
      numbers move); an encoding-line change counts as code;
+   - edits only inside docstrings (the same AST with docstrings blanked) →
+     tests that read the file, tests whose file mentions a doc reader
+     (`__doc__`, `getdoc`, `doctest`, `pydoc`, `help(`) and tests that ran a
+     sqlglot line that does;
    - refactors proven from the two ASTs (`src/blast/refactor.py`) → the same
      as a comment-only edit: a local variable renamed everywhere in its
      function (not a parameter; no `locals()`/`eval`, no f-string `{x=}`); a
@@ -91,7 +95,11 @@ ones against the patched code, and report only those that fail.
      → only tests whose recorded operands (`data/cmp`, per test and site)
      could compare differently; a test that never evaluated it is unaffected.
      `==` vs `is` is judged only for literals, identity-equality types and
-     members of one enum;
+     members of one enum, and for `==`/`!=` between a literal of a builtin
+     type and an object whose pinned `__eq__` begins by checking
+     `type(self) is type(other)` (after an optional `self is other`), with
+     `__ne__` the default or `not self.__eq__(other)`, when the edit is in
+     neither (Expression's `x == None` is then `x is None`);
    - a patch that only rewrites one `and`/`or` over the same operands, in
      the same order (`a and b` → `a or b`, regrouping) → only tests whose
      recorded operand truth values (`data/bool`, per test and site) give a
@@ -100,7 +108,8 @@ ones against the patched code, and report only those that fail.
    - a patch that changes only literal parameter defaults → tests that ran
      those functions' bodies (a default is read only by calls that leave the
      argument out), unless a body also runs at import or shares the
-     signature's line;
+     signature's line; a `typing.overload` stub is dropped when defined, so
+     its defaults reach no call;
    - a patch that flips one `arg_types` flag → tests that validated an
      instance of that class or a subclass with that argument missing
      (`data/req.json.gz`, from a `MAP_REQ=1` pass wrapping

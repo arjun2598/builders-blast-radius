@@ -483,6 +483,87 @@ def _maybe_cosmetic(fd: FileDiff) -> bool:
     return True
 
 
+_DOC_WORDS = re.compile(r"__doc__|getdoc|doctest|pydoc|\bhelp\(")
+
+
+def _doc_ranges(tree) -> list[tuple[int, int]]:
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            b = node.body
+            if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) \
+                    and isinstance(b[0].value.value, str):
+                out.append((b[0].lineno, b[0].end_lineno or b[0].lineno))
+    return out
+
+
+def _blank_docs(tree) -> str:
+    import copy
+
+    t = copy.deepcopy(tree)
+    for node in ast.walk(t):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            b = node.body
+            if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) \
+                    and isinstance(b[0].value.value, str):
+                b[0].value.value = ""
+    return ast.dump(t, include_attributes=False)
+
+
+def _docstrings_only(old_tree, new_tree, fd: FileDiff) -> bool:
+    """Every changed line, old and new, sits in a docstring, and the two
+    trees are equal with docstrings blanked."""
+    def inside(lines, tree):
+        r = _doc_ranges(tree)
+        return bool(lines) and all(any(a <= i <= b for a, b in r) for i in lines)
+
+    if not inside(fd.changed_old_lines(), old_tree) or not inside(set(fd.changed_new_lines()), new_tree):
+        return False
+    return _blank_docs(old_tree) == _blank_docs(new_tree)
+
+
+def _doc_readers(m) -> set[int]:
+    """Tests that can see a docstring: those whose test file mentions a doc
+    reader, and those that ran a sqlglot line that does."""
+    out: set[int] = set()
+    for f, text in m.sources.items():
+        if not f.endswith(".py") or _DOC_WORDS.search(text) is None:
+            continue
+        if f.startswith("sqlglot/"):
+            lines = [i for i, l in enumerate(text.split("\n"), 1) if _DOC_WORDS.search(l)]
+            out |= m.line_tests(f, lines)
+        else:
+            out |= m.file_users(f) | set(m.by_file.get(f, ()))
+    return out
+
+
+def _typing_aliases(tree) -> tuple[set[str], set[str]]:
+    """(names bound to the typing module, names bound to typing.overload)
+    by module-level imports."""
+    mods, funcs = set(), set()
+    for s in tree.body:
+        if isinstance(s, ast.Import):
+            for a in s.names:
+                if a.name in ("typing", "typing_extensions"):
+                    mods.add(a.asname or a.name)
+        elif isinstance(s, ast.ImportFrom) and s.module in ("typing", "typing_extensions") and not s.level:
+            for a in s.names:
+                if a.name == "overload":
+                    funcs.add(a.asname or a.name)
+    return mods, funcs
+
+
+def _is_overload(fn, aliases) -> bool:
+    mods, funcs = aliases
+    for d in fn.decorator_list:
+        if isinstance(d, ast.Name) and d.id in funcs:
+            return True
+        if isinstance(d, ast.Attribute) and d.attr == "overload" and isinstance(d.value, ast.Name) \
+                and d.value.id in mods:
+            return True
+    return False
+
+
 def _strip_docless(src: str) -> str | None:
     try:
         return ast.dump(ast.parse(src), include_attributes=False)
@@ -799,6 +880,13 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
     except SyntaxError:  # handled above, kept for safety
         sel.everything = True
         return
+    if path.endswith(".py") and _docstrings_only(tree, new_tree, fd):
+        # only docstrings changed: the code is the same and the new text is
+        # seen only through __doc__ (or the source text). Docstrings are read
+        # by tests that mention a doc reader and by the lines that do.
+        sel.tests |= m.code_readers & m.file_users(path) | _doc_readers(m)
+        sel.notes.append(f"docstrings only {path}")
+        return
     if path.endswith(".py"):
         # a refactor proven from the two ASTs (renamed locals or private
         # names, reordered defs or imports): as for a comment-only edit
@@ -835,7 +923,13 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
             # credited with, or shares a line with the signature)
             at_import = m.imports.get(path, set())
             spans = []
+            typing_names = _typing_aliases(tree)
             for fn in defaults:
+                if _is_overload(fn, typing_names):
+                    # typing.overload drops the function it decorates: no
+                    # call ever reads its defaults
+                    spans.append(None)
+                    continue
                 first, last = fn.body[0].lineno, fn.end_lineno or fn.body[0].lineno
                 sig_end = max([fn.lineno] + [getattr(n, "end_lineno", fn.lineno) or fn.lineno
                                              for n in [*fn.args.defaults, *fn.args.kw_defaults] if n is not None])
@@ -844,8 +938,9 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
                     break
                 spans.append((first, last))
             if spans:
-                for first, last in spans:
-                    sel.tests |= m.line_tests(path, range(first, last + 1))
+                for span in spans:
+                    if span is not None:
+                        sel.tests |= m.line_tests(path, range(span[0], span[1] + 1))
                 sel.tests |= m.code_readers & m.file_users(path)
                 sel.tests |= m.popen
                 sel.notes.append(f"parameter defaults {path}: {[fn.name for fn in defaults]}")
@@ -945,6 +1040,13 @@ def _narrow_compare(fd: FileDiff, edit, m: Map, sel: Selection) -> None:
     """The file's only change is one comparison: keep the tests whose
     recorded evaluations could come out differently, plus tests the operand
     pass didn't map and tests that read the source file."""
+    if edit.op_new in ("Eq", "NotEq") and getattr(m, "repo", None):
+        types = cmpcheck.site_types(edit, fd.path, m.cmp)
+        if types:
+            try:
+                edit.type_eq = cmpcheck.type_guarded(types, m.repo, fd.path, edit.site[0])
+            except Exception:  # noqa: BLE001
+                edit.type_eq = set()
     r = cmpcheck.narrow(edit, fd.path, m.cmp)
     if r is None:
         sel.notes.append(f"comparison edit {fd.path}:{edit.site[0]} not judged")
@@ -1558,8 +1660,9 @@ class Resolver:
                     break
             # textual reads like Base.Tokenizer.KEYWORDS elsewhere (often at import)
             pat = re.compile(rf"\b{re.escape(last)}\.{re.escape(a)}\b")
+            plain = f"{last}.{a}"
             for f, text in m.sources.items():
-                if pat.search(text) is None:
+                if plain not in text or pat.search(text) is None:
                     continue
                 fctx = self.ctx(f)
                 if fctx is None:

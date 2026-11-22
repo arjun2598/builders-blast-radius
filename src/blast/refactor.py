@@ -38,6 +38,7 @@ _NAME_FIELDS = {
     ast.alias: ("asname",), ast.Attribute: ("attr",), ast.keyword: ("arg",),
 }
 _FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef)
+_CANON_FIELDS = frozenset(("body", "orelse", "finalbody", "names"))
 _ATTR_KINDS = (ast.Attribute, ast.keyword)
 
 
@@ -47,9 +48,8 @@ class _Mismatch(Exception):
 
 def equivalent(old: ast.Module, new: ast.Module, path: str, sources: dict) -> str | None:
     try:
-        a, b = _canon(old), _canon(new)
         pairs: list = []  # (old name, new name, outermost function of old or None, node type)
-        _walk(a, b, None, pairs)
+        _walk(old, new, None, pairs)
     except (_Mismatch, RecursionError):
         return None
     verdict = "same"
@@ -92,21 +92,15 @@ def equivalent(old: ast.Module, new: ast.Module, path: str, sources: dict) -> st
 
 # -- canonical order ---------------------------------------------------------
 
-def _canon(tree: ast.Module) -> ast.Module:
-    """A copy with import runs and def runs in a canonical order."""
-    import copy
-
-    t = copy.deepcopy(tree)
-    for node in ast.walk(t):
-        for field in ("body", "orelse", "finalbody"):
-            stmts = getattr(node, field, None)
-            if isinstance(stmts, list) and stmts and isinstance(stmts[0], ast.stmt):
-                setattr(node, field, _canon_body(stmts, isinstance(node, (ast.Module, ast.ClassDef))))
-        if isinstance(node, ast.ImportFrom):
-            node.names.sort(key=lambda a: (a.name, a.asname or ""))
-        if isinstance(node, ast.Import) and len(node.names) > 1:
-            node.names.sort(key=lambda a: (a.name, a.asname or ""))
-    return t
+def _canon_field(node, field: str, value):
+    """A field's value in canonical order: import runs and def runs sorted
+    (statement lists), imported names sorted. Nothing is modified."""
+    if field in ("body", "orelse", "finalbody"):
+        if isinstance(value, list) and value and isinstance(value[0], ast.stmt):
+            return _canon_body(value, isinstance(node, (ast.Module, ast.ClassDef)))
+    elif field == "names" and (isinstance(node, ast.ImportFrom) or (isinstance(node, ast.Import) and len(value) > 1)):
+        return sorted(value, key=lambda a: (a.name, a.asname or ""))
+    return value
 
 
 def _canon_body(stmts: list, defs_movable: bool) -> list:
@@ -186,6 +180,8 @@ def _walk(a, b, fn, pairs) -> None:
     names = _NAME_FIELDS.get(type(a), ())
     for field in a._fields:
         x, y = getattr(a, field, None), getattr(b, field, None)
+        if field in _CANON_FIELDS:
+            x, y = _canon_field(a, field, x), _canon_field(b, field, y)
         if field in names:
             if x != y:
                 if not (isinstance(x, str) and isinstance(y, str)):
