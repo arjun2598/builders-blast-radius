@@ -64,6 +64,7 @@ class Map:
         self.subtask_raise = set(m.get("subtask_raise", ()))  # skipped tasks raise SkippedTask (see runner)
         self.cmp: cmpcheck.CmpMap | None = None  # comparison operands, set by the caller
         self.bool: cmpcheck.CmpMap | None = None  # and/or operand truth values, set by the caller
+        self.req: cmpcheck.ReqMap | None = None  # validations missing each argument, set by the caller
         self.keys: cmpcheck.KeyMap | None = None  # dict keys read, set by the caller
         self.needs: dict | None = None  # module file -> tests that imported it, set by load_needs
         self.needs_mapped: set[int] = set()
@@ -623,6 +624,29 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
             sel.tests |= m.code_readers & m.file_users(path)
             sel.notes.append(f"lambda bodies {path}: {[l.lineno for l in lambdas]}")
             return
+        defaults = refactor.default_edits(old_src, new_src)
+        if defaults:
+            # only literal parameter defaults changed: they matter to calls
+            # that leave the argument out, and every call runs the body
+            # (unless the body also runs while importing, which no test is
+            # credited with, or shares a line with the signature)
+            at_import = m.imports.get(path, set())
+            spans = []
+            for fn in defaults:
+                first, last = fn.body[0].lineno, fn.end_lineno or fn.body[0].lineno
+                sig_end = max([fn.lineno] + [getattr(n, "end_lineno", fn.lineno) or fn.lineno
+                                             for n in [*fn.args.defaults, *fn.args.kw_defaults] if n is not None])
+                if first <= sig_end or any(l in at_import for l in range(first, last + 1)):
+                    spans = None
+                    break
+                spans.append((first, last))
+            if spans:
+                for first, last in spans:
+                    sel.tests |= m.line_tests(path, range(first, last + 1))
+                sel.tests |= m.code_readers & m.file_users(path)
+                sel.tests |= m.popen
+                sel.notes.append(f"parameter defaults {path}: {[fn.name for fn in defaults]}")
+                return
         same = refactor.equivalent(tree, new_tree, path, sources)
         if same == "probe" and path.startswith("sqlglot/") and path in m.import_graph().eager \
                 and path not in m.import_ok:
@@ -648,6 +672,12 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
             bool_edit = cmpcheck.find_bool_edit(old_src, new_src, tree, new_tree)
         except Exception:  # noqa: BLE001
             bool_edit = None
+    flag_edit = None
+    if edit is None and bool_edit is None and m.req is not None and path.startswith("sqlglot/"):
+        try:
+            flag_edit = cmpcheck.find_flag_edit(old_src, new_src, tree, new_tree)
+        except Exception:  # noqa: BLE001
+            flag_edit = None
     res = Resolver(m, sel)
     if m.keys is not None and path.startswith("sqlglot/"):
         try:
@@ -693,6 +723,8 @@ def _select_file(fd: FileDiff, old_src, new_src, m: Map, sel: Selection) -> None
         _narrow_compare(fd, edit, m, sel)
     elif bool_edit is not None:
         _narrow_bool(fd, bool_edit, m, sel)
+    elif flag_edit is not None:
+        _narrow_flag(fd, flag_edit, m, sel)
     elif path.startswith("sqlglot/"):
         try:
             span = cmpcheck.find_handler_edit(old_src, new_src, tree, new_tree)
@@ -723,6 +755,29 @@ def _narrow_compare(fd: FileDiff, edit, m: Map, sel: Selection) -> None:
     sel.tests = m.drop_tasks_of(base - safe, m.cmp.mapped, base - safe) | set(m.opens.get(fd.path, ()))
     sel.notes.append(f"comparison edit {fd.path}:{edit.site[0]} {edit.op_old}->{edit.op_new}: "
                      f"{len(base)} -> {len(sel.tests)}")
+
+def _narrow_flag(fd: FileDiff, edit, m: Map, sel: Selection) -> None:
+    """The file's only change flips one arg_types required flag: keep the
+    tests that validated an instance of that class (or a subclass) without
+    that argument, plus unmapped tests and tests that read the file."""
+    qual, arg, was, now = edit
+    cname = fd.path[:-3].replace("/", ".").removesuffix(".__init__") + ":" + qual
+    if was == now:
+        r = (set(), set(m.req.mapped))  # same required_args
+    else:
+        r = m.req.narrow(cname, arg)
+    if r is None:
+        sel.notes.append(f"arg_types flag {qual}.{arg} validated while importing")
+        return
+    hit, safe = r
+    if sel.everything:
+        base = {t["number"] for t in m.tests} | m.all_subtasks()
+        sel.everything = False
+    else:
+        base = set(sel.tests)
+    sel.tests = m.drop_tasks_of(base - safe, m.req.mapped, base - safe) | set(m.opens.get(fd.path, ()))
+    sel.notes.append(f"arg_types flag {qual}.{arg} {was}->{now}: {len(base)} -> {len(sel.tests)}")
+
 
 def _narrow_bool(fd: FileDiff, edit, m: Map, sel: Selection) -> None:
     """As _narrow_compare, for a file whose only change rewrites one and/or

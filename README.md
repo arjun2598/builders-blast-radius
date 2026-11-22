@@ -94,6 +94,14 @@ ones against the patched code, and report only those that fail.
      recorded operand truth values (`data/bool`, per test and site) give a
      different result, or that would now skip or newly evaluate an operand
      that isn't a plain attribute, name or pure builtin call;
+   - a patch that changes only literal parameter defaults → tests that ran
+     those functions' bodies (a default is read only by calls that leave the
+     argument out), unless a body also runs at import or shares the
+     signature's line;
+   - a patch that flips one `arg_types` flag → tests that validated an
+     instance of that class or a subclass with that argument missing
+     (`data/req.json.gz`, from a `MAP_REQ=1` pass wrapping
+     `Expression.error_messages`, the only reader of `required_args`);
    - a patch that changes only one value of a class-level dict literal →
      tests that read that key's value (`data/keys`) instead of every reader
      of the dict, unless the key was read at import time;
@@ -243,11 +251,16 @@ optimize call. When every function a code change touches ran only inside
 compares the digest. If it matches, the rest would run as at the pinned
 commit, so the task is skipped. Otherwise the task runs in full. If the
 first few digests of a big test all differ, the test is given up on and
-listed:
+listed. This is off unless `BLAST_STAGE` points at the map: on the practice
+commits it ran tests that failed anyway, adding CPU without saving time:
 
 ```sh
 cd work/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=../../src ../venv/bin/python ../../tools/stage_map.py ../../data/stage.json.gz 7
 ```
+
+The required-flag map (`MAP_REQ=1` into `../rawreq` and `../rawreqsplit` the
+same way, then, from `work/sqlglot`,
+`python ../../tools/build_req.py ../rawreq ../rawreqsplit ../../blast-radius-sample/sample/tests.json ../../data/map.json.gz ../../data/req.json.gz`).
 
 The generator dispatch map:
 

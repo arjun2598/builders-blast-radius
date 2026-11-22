@@ -373,3 +373,55 @@ def lambda_edits(old: ast.Module, new: ast.Module) -> list | None:
     except (_Mismatch, RecursionError):
         return None
     return changed or None
+
+
+def _funcs(tree):
+    return [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+
+def _literal(node) -> bool:
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Not)):
+        return _literal(node.operand)
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_literal(e) for e in node.elts)
+    return False
+
+
+def default_edits(old_src: str, new_src: str) -> list | None:
+    """Functions of old_src whose parameter defaults are all that differ in
+    new_src, every changed default a literal on both sides. A default is
+    evaluated once, where the def runs, and read only by calls that leave
+    the argument out, which run the body. None unless that is the only
+    change."""
+    if old_src.count("\n") != new_src.count("\n"):
+        return None
+    try:
+        a, b = ast.parse(old_src), ast.parse(new_src)
+    except SyntaxError:
+        return None
+    fa, fb = _funcs(a), _funcs(b)
+    if len(fa) != len(fb):
+        return None
+    changed = []
+    for x, y in zip(fa, fb):
+        dx = [*x.args.defaults, *x.args.kw_defaults]
+        dy = [*y.args.defaults, *y.args.kw_defaults]
+        if len(dx) != len(dy) or [d is None for d in dx] != [d is None for d in dy]:
+            return None
+        diff = [(p, q) for p, q in zip(dx, dy) if p is not None and ast.dump(p) != ast.dump(q)]
+        if not diff:
+            continue
+        if not all(_literal(p) and _literal(q) for p, q in diff):
+            return None
+        changed.append(x)
+    if not changed:
+        return None
+    for t in (a, b):
+        for f in _funcs(t):
+            f.args.defaults = [ast.Constant(0) for _ in f.args.defaults]
+            f.args.kw_defaults = [None if d is None else ast.Constant(0) for d in f.args.kw_defaults]
+    if ast.dump(a) != ast.dump(b):
+        return None
+    return changed

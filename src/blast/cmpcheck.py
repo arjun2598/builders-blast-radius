@@ -463,3 +463,56 @@ def narrow_bool(e: BoolEdit, path: str, bm: CmpMap):
         if any(flips[i] for i in idx):
             hit.update(tests)
     return hit, set(bm.mapped) - hit
+
+
+# ---- arg_types required flags ---------------------------------------------
+
+def find_flag_edit(old_src: str, new_src: str, old_tree: ast.AST, new_tree: ast.AST):
+    """(class qualname, arg, old flag, new flag) when the patch changes only
+    one literal value of a class-level `arg_types` dict. Expression class
+    creation turns those values into required_args, read only when
+    validating an instance (Expression.error_messages)."""
+    r = find_dict_entry_edit(old_src, new_src, old_tree, new_tree)
+    if r is None or r[1] != "arg_types":
+        return None
+    out: list = []
+    _diffs(old_tree, new_tree, [], out)
+    a, b, parents = out[0]
+    if not parents or not isinstance(parents[-1], ast.Dict):
+        return None
+    try:
+        va, vb, key = ast.literal_eval(a), ast.literal_eval(b), ast.literal_eval(r[2])
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
+    if not isinstance(key, str):
+        return None
+    return r[0], key, bool(va), bool(vb)
+
+
+class ReqMap:
+    """data/req.json.gz (tools/build_req.py)."""
+
+    def __init__(self, path: str):
+        import gzip
+
+        d = json.loads(gzip.decompress(open(path, "rb").read()))
+        self.mapped = set(d["mapped"])
+        self.imports = [(c, set(m)) for c, m in d["import"]]
+        self.mro = d["mro"]
+        self.calls = d["calls"]
+
+    def _under(self, c: str, cname: str) -> bool:
+        bases = self.mro.get(c)
+        return bases is None or cname in bases  # unknown bases: assume so
+
+    def narrow(self, cname: str, arg: str):
+        """(tests that validated an instance of cname or a subclass with arg
+        missing, mapped tests that did not), or None if that happened while
+        importing."""
+        if any(arg in m and self._under(c, cname) for c, m in self.imports):
+            return None
+        hit: set = set()
+        for c, per in self.calls.items():
+            if arg in per and self._under(c, cname):
+                hit.update(per[arg])
+        return hit, self.mapped - hit

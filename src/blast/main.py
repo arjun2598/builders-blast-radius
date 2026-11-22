@@ -33,11 +33,14 @@ DUCK = Path(os.environ.get("BLAST_DUCK", "/app/data/duck.pkl.gz"))
 CMP = Path(os.environ.get("BLAST_CMPMAP", "/app/data/cmp"))
 KEYS = Path(os.environ.get("BLAST_KEYMAP", "/app/data/keys"))
 BOOL = Path(os.environ.get("BLAST_BOOLMAP", "/app/data/bool"))
+REQ = Path(os.environ.get("BLAST_REQMAP", "/app/data/req.json.gz"))
 NEEDS = Path(os.environ.get("BLAST_NEEDS", "/app/data/imports.json.gz"))
 POPEN = Path(os.environ.get("BLAST_POPEN", "/app/data/popen.json"))
 PREBUILT = Path(os.environ.get("BLAST_PREBUILT", "/app/prebuilt.pkl"))
 DISP = Path(os.environ.get("BLAST_DISP", "/app/data/disp.json.gz"))
-STAGE = Path(os.environ.get("BLAST_STAGE", "/app/data/stage.json.gz"))
+# off unless set: on the practice board the cut made tests run that failed
+# anyway, adding CPU and no simulated time
+STAGE = Path(os.environ.get("BLAST_STAGE", ""))
 CUT_COST = 1.15  # a stage cut's CPU, digest included, over its measured CPU
 CUT_GIVE_UP = 8  # tests with at least this many cut tasks give up early (runner.CutGiveUp)
 SUB_BASE = 10_000_000  # map numbers of single pool tasks, see build_map.py
@@ -481,33 +484,13 @@ class CostModel:
         slow = {t for t in cands if self.test_cpu(t) >= max(SLOW, self.secs[t])}
         rest = cands - slow
         purge = any(f.endswith(".py") for f in changed)
-        if not rest:
+        list_all = self.pack_cost(cands)
+        expect_fail = (P_FAIL * (WORKER_COST_MS / 1000 + 0.2)) if not slow else 0.3
+        run_rest = self.run_cpu(rest, purge) + self.pack_cost(slow) + expect_fail
+        if not rest or list_all <= run_rest:
             return set(cands), []
-        # Which tests to list unrun: listing one costs its share of the
-        # packed simulated time, running it costs CPU. Try listing the tests
-        # dearest to run per listed second first, in growing prefixes, from
-        # none of them to all, and keep the cheapest plan.
-        cpu = {t: self.test_cpu(t) for t in rest}
-        by_ratio = sorted(rest, key=lambda t: (-cpu[t] / max(self.secs[t], 1e-3), t))
-        n = len(by_ratio)
-        ks = sorted({0, n} | {min(n, round(n * q)) for q in (0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.85, 0.95)}
-                    | set(range(min(n, 12))))
-        best = None
-        for k in ks:
-            listed = slow | set(by_ratio[:k])
-            run = by_ratio[k:]
-            cost = self.approx_pack(listed)
-            if run:
-                # a failure among the run tests is reported too: into a
-                # worker of its own unless some are listed anyway
-                cost += self.run_cpu(run, purge) + (0.3 if listed else P_FAIL * (WORKER_COST_MS / 1000 + 0.2))
-            if best is None or cost < best[0] - 1e-9:
-                best = (cost, k)
-        k = best[1]
-        if k >= n:
-            return set(cands), []
-        order = sorted(by_ratio[k:], key=lambda t: (cpu[t], t))
-        return slow | set(by_ratio[:k]), order
+        order = sorted(rest, key=lambda t: (self.test_cpu(t), t))
+        return slow, order
 
     def approx_pack(self, tests) -> float:
         """pack_cost without packing: the largest of the biggest test and an
@@ -557,10 +540,14 @@ def main() -> None:
         from . import cmpcheck
 
         m.bool = cmpcheck.CmpMap(str(BOOL))
+    if REQ.is_file():
+        from . import cmpcheck
+
+        m.req = cmpcheck.ReqMap(str(REQ))
     m.load_needs(str(NEEDS))
     m.load_popen(str(POPEN))
     m.load_disp(str(DISP))
-    m.stage, m.stage_target, stage_cpu = load_stage(STAGE, by_id)
+    m.stage, m.stage_target, stage_cpu = load_stage(STAGE, by_id) if str(STAGE) not in ("", ".") else ({}, None, {})
     for f in list(REPO.glob("sqlglot/**/*.py")) + list(REPO.glob("tests/**/*.py")):
         m.sources[str(f.relative_to(REPO))] = f.read_text()
     from . import prebuild

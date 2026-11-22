@@ -645,6 +645,32 @@ if os.environ.get("MAP_LINES", "1") == "1":
 sys.addaudithook(_audit)
 
 
+# With MAP_REQ=1 every Expression.error_messages call (the only reader of
+# required_args, which class creation derives from the arg_types flags)
+# records the instance's class and which of its arg_types were missing: a
+# flipped required flag can change only calls missing that argument.
+
+_req: dict = {}  # key -> set of (class "module:qualname", missing arg names)
+
+
+def _install_req():
+    import sqlglot.expressions.core as core
+
+    orig = core.Expression.error_messages
+
+    def error_messages(self, args=None):
+        try:
+            a = self.args
+            missing = tuple(sorted(k for k in self.arg_types
+                                   if (v := a.get(k)) is None or (isinstance(v, list) and not v)))
+            _req.setdefault(_key, set()).add((_cname(type(self)), missing))
+        except Exception:  # noqa: BLE001
+            pass
+        return orig(self, args)
+
+    core.Expression.error_messages = error_messages
+
+
 def pytest_configure(config):
     # Import every sqlglot module up front so module-level lines count as
     # import-time ("") and are never credited to whichever test loaded them.
@@ -663,6 +689,8 @@ def pytest_configure(config):
     _wrap_inits()
     if os.environ.get("MAP_DISPATCH") == "1":
         _install_dispatch()
+    if os.environ.get("MAP_REQ") == "1":
+        _install_req()
 
 
 def _class_keys(types):
@@ -773,6 +801,7 @@ def sections_dump(with_names=False):
                          for k, v in _keys.items()},
         "disp": lambda: {k: sorted(map(list, v)) for k, v in _disp.items()},
         "disp_mro": lambda: dict(_disp_mro),
+        "req": lambda: {k: sorted([c, list(m)] for c, m in v) for k, v in _req.items()},
     }
     data = {}
     for name, fn in sections.items():
